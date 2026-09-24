@@ -61,6 +61,8 @@ def runner():
         "milestones": [],
         "history": [],
         "decisions": [],
+        "rejections": [],
+        "verification_rejections": [],
         "status": "predicted",
         "started_at": time.perf_counter(),
         "record": False,
@@ -230,6 +232,23 @@ def test_done_advances_one_model_generated_subgoal(runner):
     runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
     assert runner.state["status"] == "done"
     assert runner.state["plan_index"] == 2
+
+
+def test_resume_rewinds_the_rejected_done_and_continues(runner):
+    runner.state["plan"] = ["Fill the query", "Submit the query"]
+    runner.state["plan_index"] = 2
+    runner.state["milestones"] = ["Fill the query", "Submit the query"]
+    runner.state["step_history_index"] = 4
+    runner.state["status"] = "done"
+    runner.resume("assertions rejected the DONE claim")
+    assert runner.state["status"] == "ready"
+    assert runner.state["plan_index"] == 1
+    assert runner.state["milestones"] == ["Fill the query"]
+    assert runner.state["step_history_index"] == 0
+    assert runner.state["verification_rejections"][0]["reason"] == "assertions rejected the DONE claim"
+    runner.state["status"] = "ready"
+    with pytest.raises(ValueError):
+        runner.resume("only a completed run can resume")
 
 
 def test_default_mode_does_not_generate_or_install_a_task_plan(runner, monkeypatch):

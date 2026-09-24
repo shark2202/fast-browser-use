@@ -1,5 +1,6 @@
 """Local-browser freshness/execution regressions. No model calls or external websites."""
 
+import json
 from urllib.parse import quote
 
 from fast_browser_use.browser import Browser, StalePage
@@ -89,7 +90,7 @@ def main():
           <label><input id="check" type="checkbox">Enabled</label>
           <label><input id="radio" type="radio">Choice</label>
           <input id="readonly" aria-label="Read only" readonly>
-          <input id="secret" type="password" value="never expose this">
+          <input id="secret" type="password" aria-label="Secret code" value="never expose this">
           <button id="off" disabled>Disabled</button>
           <select id="category" aria-label="Category">
             <option>All</option><option>Design</option><option disabled>Unavailable</option>
@@ -108,6 +109,7 @@ def main():
             "nearby price": "document.querySelector('#price').textContent='Total $100'",
             "form value": "document.querySelector('#query').value='changed'",
             "form toggle": "document.querySelector('#check').checked=true",
+            "password value": "document.querySelector('#secret').value='changed'",
             "target replacement": "document.querySelector('#buy').outerHTML=document.querySelector('#buy').outerHTML",
         }.items():
             page = browser.observe(screenshot=False)
@@ -129,6 +131,20 @@ def main():
         browser.act(select, page)
         assert browser.evaluate("document.querySelector('#category').value") == "Design"
         passed.append("native dropdown selects an observed option")
+
+        page = browser.observe(screenshot=False)
+        password = next(a for a in page["actions"] if a["label"] == "Secret code" and a["kind"] == "fill")
+        # An earlier invalidation test left a short live value; the mask must track that length.
+        length = len(browser.evaluate("document.querySelector('#secret').value"))
+        assert password["value"] == "•" * min(length, 16)
+        assert "never expose this" not in json.dumps(page)
+        browser.act(password, page, text="typed-secret")
+        assert browser.evaluate("document.querySelector('#secret').value") == "typed-secret"
+        page = browser.observe(screenshot=False)
+        password = next(a for a in page["actions"] if a["label"] == "Secret code" and a["kind"] == "fill")
+        assert password["value"] == "•" * 12
+        assert "typed-secret" not in json.dumps(page)
+        passed.append("password fields are fillable with values masked everywhere")
 
         browser.evaluate(
             "document.querySelector('#query').addEventListener('input',()=>setTimeout(()=>{"

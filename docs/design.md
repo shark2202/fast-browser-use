@@ -19,6 +19,11 @@ control values. The optional checklist mode uses only its current subgoal for co
 Filled fields and landing-page descriptions are not proof of a submitted search. This is still a model judgment, with known
 limitations on tasks whose completion requires understanding arbitrary page text.
 
+`fbu run` treats the model's DONE with caller-supplied `--expect-*` assertions as a gate, not a verdict: a failed
+independent check rejects that DONE, rewinds the latest milestone and continues from a fresh observation, bounded by
+`FBU_VERIFY_RETRIES` additional DONE attempts (default 2; `0` fails immediately). Each rejection is recorded in the
+trace. Assertion content never enters the model prompt.
+
 When the check says continue, the action scorer chooses among currently legal actions. A tie continues;
 there is no automatic advancement merely because an action was executed. Each completed subgoal must
 receive the model's DONE judgment. Final demonstrated outcomes are checked by separate browser code.
@@ -104,6 +109,10 @@ probability of success. The inspector labels these values as scores.
 - The MVP handles visible HTML/ARIA clicks, text input, native selects, page and container scrolling, and waits.
   Visible labels can operate styled native checkboxes. Each scroll action names an observed region;
   the executor checks its hit target before sending a wheel event. Covered text and controls are excluded.
+- Password fields are fillable through the ordinary text path, but never readable: actions, guards and page keys
+  expose only a length-based mask, so no credential read from the page reaches the model context or the trace.
+  A password supplied in the goal is still typed, recorded in the trace and echoed by RECENT ACTIONS, like any
+  other generated field text.
 - No screenshots enter the model. Screenshots and video are for the human inspector and evidence.
 - No iframe traversal, shadow-root traversal, canvas grounding, file upload, or new-tab orchestration.
 - A `DONE` choice is a model claim. A task-specific independent check is required to claim success.

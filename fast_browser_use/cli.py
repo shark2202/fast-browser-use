@@ -120,11 +120,28 @@ def main():
         get_model()
         folder = Path(args.trace)
         folder.parent.mkdir(parents=True, exist_ok=True)
+        retries = os.environ.get("FBU_VERIFY_RETRIES", "2")
+        if not retries.isdigit():
+            raise ValueError("FBU_VERIFY_RETRIES must be a nonnegative integer")
+        retries = int(retries)
         with Agent(args.url, args.goal) as agent:
             try:
-                for state in agent.run():
-                    last = state["history"][-1] if state["history"] else {}
-                    print(state["elapsed_ms"], state["status"], last.get("action", ""), flush=True)
+                while True:
+                    for state in agent.run():
+                        last = state["history"][-1] if state["history"] else {}
+                        print(state["elapsed_ms"], state["status"], last.get("action", ""), flush=True)
+                    if agent.state["status"] != "done" or not has_expectations:
+                        break
+                    # A rejected DONE re-enters the loop from a fresh observation.
+                    # Assertion content never enters the model prompt.
+                    try:
+                        verification = verify_outcome(agent.browser, **expected)
+                    except Exception as exc:
+                        verification = {"passed": False, "error": f"{type(exc).__name__}: {exc}"}
+                    if verification["passed"] or len(agent.state["verification_rejections"]) >= retries:
+                        break
+                    print("Independent assertions rejected this DONE; re-observing and continuing", flush=True)
+                    agent.resume("outcome assertions rejected the model's DONE claim")
             finally:
                 result = agent.snapshot()
                 if has_expectations:

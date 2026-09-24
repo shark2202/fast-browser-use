@@ -106,7 +106,7 @@ def test_run_independently_rejects_false_done_and_retains_trace(monkeypatch, tmp
     class FakeAgent:
         def __init__(self, url, goal):
             assert (url, goal) == ("https://example.test", "Find a result")
-            self.state = {"status": "done"}
+            self.state = {"status": "done", "verification_rejections": []}
             self.browser = SimpleNamespace(evaluate=Mock(return_value={
                 "url": "https://example.test", "title": title, "text": "",
             }))
@@ -116,6 +116,9 @@ def test_run_independently_rejects_false_done_and_retains_trace(monkeypatch, tmp
 
         def __exit__(self, *args):
             pass
+
+        def resume(self, reason):
+            self.state["verification_rejections"].append({"reason": reason})
 
         def run(self):
             return iter(())
@@ -138,6 +141,90 @@ def test_run_independently_rejects_false_done_and_retains_trace(monkeypatch, tmp
             cli.main()
     saved = json.loads(trace.read_text())
     assert saved["status"] == "done" and saved["verification"]["passed"] == passed
+
+
+def test_run_continues_after_rejected_done_until_assertions_pass(monkeypatch, tmp_path):
+    import json
+
+    class FakeAgent:
+        def __init__(self, url, goal):
+            self.state = {"status": "done", "verification_rejections": []}
+            self.browser = SimpleNamespace(evaluate=Mock(side_effect=lambda *_args, **_kwargs: {
+                "url": "https://example.test",
+                # The page settles to the expected title after one rejected DONE.
+                "title": "Still loading" if not self.state["verification_rejections"] else "Result",
+                "text": "",
+            }))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def resume(self, reason):
+            self.state["verification_rejections"].append({"reason": reason})
+
+        def run(self):
+            return iter(())
+
+        def snapshot(self):
+            return dict(self.state)
+
+    trace = tmp_path / "result.json"
+    monkeypatch.setattr(cli, "load_environment", lambda: None)
+    monkeypatch.setattr("fast_browser_use.agent.Agent", FakeAgent)
+    monkeypatch.setattr("fast_browser_use.model.get_model", Mock())
+    monkeypatch.setattr(sys, "argv", [
+        "fbu", "run", "https://example.test", "--goal", "Find a result",
+        "--expect-title", "Result", "--trace", str(trace),
+    ])
+    cli.main()
+    saved = json.loads(trace.read_text())
+    assert saved["verification"]["passed"] is True
+    assert len(saved["verification_rejections"]) == 1
+
+
+@pytest.mark.parametrize("retries", ["0", "1"])
+def test_run_stops_after_bounded_assertion_rejections(monkeypatch, tmp_path, retries):
+    import json
+
+    class FakeAgent:
+        def __init__(self, url, goal):
+            self.state = {"status": "done", "verification_rejections": []}
+            self.browser = SimpleNamespace(evaluate=Mock(return_value={
+                "url": "https://example.test", "title": "Still loading", "text": "",
+            }))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def resume(self, reason):
+            self.state["verification_rejections"].append({"reason": reason})
+
+        def run(self):
+            return iter(())
+
+        def snapshot(self):
+            return dict(self.state)
+
+    trace = tmp_path / "result.json"
+    monkeypatch.setattr(cli, "load_environment", lambda: None)
+    monkeypatch.setattr("fast_browser_use.agent.Agent", FakeAgent)
+    monkeypatch.setattr("fast_browser_use.model.get_model", Mock())
+    monkeypatch.setenv("FBU_VERIFY_RETRIES", retries)
+    monkeypatch.setattr(sys, "argv", [
+        "fbu", "run", "https://example.test", "--goal", "Find a result",
+        "--expect-title", "Result", "--trace", str(trace),
+    ])
+    with pytest.raises(SystemExit, match="assertions failed"):
+        cli.main()
+    saved = json.loads(trace.read_text())
+    assert len(saved["verification_rejections"]) == int(retries)
+    assert saved["verification"]["passed"] is False
 
 
 @pytest.mark.parametrize("source", ["mlx", "modelscope"])

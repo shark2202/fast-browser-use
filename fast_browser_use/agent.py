@@ -40,6 +40,7 @@ class Agent:
             milestones=[],
             decisions=[],
             rejections=[],
+            verification_rejections=[],
             observations=[],
             text_calls=[],
             elapsed_ms=0,
@@ -201,6 +202,22 @@ class Agent:
     def run(self):
         while self.state["status"] not in {"done", "blocked"}:
             yield self.command("tick")
+
+    def resume(self, reason):
+        """Reject the latest DONE after failed independent verification; continue the loop."""
+        state = self.state
+        if state["status"] != "done":
+            raise ValueError("Only a completed run can resume")
+        if state["plan_index"] > 0:
+            state["plan_index"] -= 1
+            state["milestones"].pop()
+        # Recent actions for the rewound subgoal now span the full history; choose() keeps its cap.
+        state["step_history_index"] = 0
+        state["status"] = "ready"
+        state["verification_rejections"].append({
+            "reason": reason,
+            "elapsed_ms": round((time.perf_counter() - state["started_at"]) * 1000),
+        })
 
     def close(self):
         self.browser.close()
