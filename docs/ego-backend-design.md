@@ -71,19 +71,65 @@ The abstract surface is the **semantic** operations `agent.py` already calls —
 
 ```python
 class Browser(Protocol):
-    def observe(self, screenshot: bool = True) -> dict: ...        # returns page dict
+    def observe(self, screenshot: bool = True) -> dict: ...        # returns page dict (see contract A)
+    # fresh has THREE branches, each its own JS expression (see §4.5): action=None → MARKER only;
+    # action.kind=='scroll' → pageKey+scrollGuard; action.kind in {click,select,fill} → pageKey+guard.
     def fresh(self, page: dict, action: dict | None = None) -> bool: ...
     def prepare(self, page: dict, *, screenshot: bool = False) -> dict: ...
-    def act(self, action: dict, page: dict, text: str | None = None) -> dict: ...
+    def act(self, action: dict, page: dict, text: str | None = None) -> dict: ...   # action: see contract B
     def close(self, *, video_path: str | None = None) -> None: ...
-    # ego-only collaboration hooks (No-op for Playwright; only EgoBrowser implements)
-    def handoff(self) -> dict: ...        # yield control to the human; returns {reason, url, ...}
-    def takeover(self) -> dict: ...       # resume control after human action; returns fresh page dict
+    # ego-only collaboration hooks (Playwright raises NotImplementedError; only EgoBrowser implements).
+    # reason is determined by the harness detector (§7), passed in; url is read from ego page.info().
+    def handoff(self, reason: str) -> dict: ...    # runs task.handOff(); returns {reason, url}
+    def takeover(self) -> dict: ...                # uses self.space_id; returns fresh page dict
     @property
-    def session_id(self) -> str | None: ...   # ego: spaceId; playwright: None
+    def session_id(self) -> str | None: ...        # ego: spaceId; playwright: None
 ```
 
-The **page-dict contract** (keys: `url`, `text`, `actions`, `scroll`, `marker`, `page_key`, `guards`, `fingerprint`, `screenshot`, `ready`, optional `preparation`) is identical across backends. `EgoBrowser` produces it by evaluating `snapshot.js` through `page.cdp("Runtime.evaluate", …)`, exactly as Playwright does through `session.send`.
+**Construction & selection contract.** The two backends have **different constructors** (Playwright: `viewport`/`headless`/`video_dir`; ego: `group`/`profile_id`/`space_id`/`handoff_mode`), so `agent.py` never calls a backend constructor directly. A module-level factory selects and constructs:
+
+```python
+def make_browser(url: str, *, browser: str | None = None, **opts) -> Browser:
+    # browser or FBU_BROWSER env (default "playwright"); opts passed through per backend.
+    # Playwright: opts = {video_dir, viewport, headless}; ignores group/profile/space_id/handoff_mode.
+    # Ego:       opts = {group, profile_id, space_id, handoff_mode}; ignores viewport/headless/video_dir
+    #            (raises on video_dir — ego cannot record Playwright video; see §10).
+```
+`agent.py` calls `make_browser(url, browser=…, **resolved_opts)`; the resolved opts are filtered by the factory so each backend receives only its kwargs.
+
+**Contract A — page dict.** Produced identically by both backends (same `snapshot.js` evaluated via `Runtime.evaluate`; screenshot/fingerprint/preparation added by the driver). `EgoBrowser` produces it through `page.cdp("Runtime.evaluate", …)`, exactly as Playwright does through `session.send`. Every key must match:
+
+| Key | Type | Producer | Consumer |
+| --- | --- | --- | --- |
+| `url` | str | snapshot.js | model/agent (prompt, trace) |
+| `title` | str | snapshot.js | model/agent (prompt) |
+| `language` | str | snapshot.js | model (prompt) |
+| `ready` | bool | snapshot.js | browser.prepare |
+| `dialogs` | list[{label,modal}] | snapshot.js | **handoff detector** (modal → handoff) |
+| `w`,`h` | int | snapshot.js | trace / viewport diagnostics |
+| `text` | str | snapshot.js | model (prompt), `fingerprint` |
+| `scroll` | {y,height} | snapshot.js | `fingerprint`, browser |
+| `actions` | list[dict] | snapshot.js | model/agent (action space), `fingerprint` |
+| `marker` | list | snapshot.js | browser.fresh (MARKER branch) |
+| `page_key` | list | snapshot.js | browser.fresh (all branches) |
+| `guards` | dict | snapshot.js | browser.fresh/act |
+| `omitted_actions` | int | snapshot.js | trace |
+| `fingerprint` | str | driver (`fingerprint()`) | agent (stale detection, trace) |
+| `screenshot` | str(b64) | driver (`Page.captureScreenshot`, jpeg q72) | agent/recording |
+| `preparation` | dict | browser.prepare (latency_ms/samples/settled) | trace (observations) |
+
+`EgoBrowser` MUST emit all 16 rows identically; missing `title`/`dialogs`/`language` would break the model prompt and the handoff detector.
+
+**Contract B — action dict.** Each entry in `page["actions"]` is one of four heterogeneous variants; `act()` dispatches per variant. `rect` is present on element actions but stripped from `marker`. `id` is assigned by snapshot.js after splice (`e1..eN`, `scroll_*`, `wait`):
+
+| kind | distinguishing fields | execution path (identical on both backends) |
+| --- | --- | --- |
+| `click` / `fill` | `node:int`, `role`, `value`, `rect` | resolve center `{x,y}` via the act-dispatch guard JS; `Input.dispatchMouseEvent` mousePressed+Released; if `fill`: then selectAll (`KeyA` + `commands:["selectAll"]`, mac modifiers=4 else 2) + `Input.insertText(text)` |
+| `select` | `node:int`, `value`, `role='combobox'` | **page-side JS, NOT CDP Input**: validate option exists & enabled; `e.value=action.value`; `dispatchEvent(input)` + `dispatchEvent(change)`; return `{x,y}` (coords unused). Failure → `RuntimeError("Dropdown execution was not confirmed")` |
+| `scroll` | `node:int\|None`, `delta:int`, `scroll_state` | resolve scroll point via `scrollPoint` JS (`document.scrollingElement` when node=None); `Input.dispatchMouseEvent(type="mouseWheel", **point, deltaX=0, deltaY=delta)` |
+| `wait` | (no `node`) | Python `time.sleep(0.1)` (no CDP) |
+
+`EgoBrowser.act` reimplements this dispatch via `page.cdp("Input.*")` and `page.cdp("Runtime.evaluate")` using the **shared JS expressions** in §4.5 — it does **not** reuse `browser_operation`'s Python (which is Playwright-`session`-specific).
 
 ### 4.2 PlaywrightBrowser
 
@@ -98,8 +144,8 @@ Holds per-session state and drives ego via subprocess. Key fields: `group` (str,
 - First `observe`: spawn a "setup" invocation that creates/reuses `taskSpace(name, {profileId?})` under `--ego-server-name=fbu-<group>`, navigates `p1` to the URL, returns `spaceId` (persisted to trace).
 - Each `observe`/`fresh`/`prepare`/`act`: spawn a bounded nodejs invocation running a JS template (see 4.4), parse JSON from stdout.
 - `handoff`: spawn `task.handOff()` invocation; set internal `handed_off=True`; return `{reason, url}`.
-- `takeover`: spawn `takeOverTaskSpace(spaceId)` + `task.userPage()` invocation; adopt if unmanaged; return fresh page dict.
-- `close`: spawn `task.finish({keep: []})` unless `handed_off` (then keep the space for resume).
+- `takeover`: spawn `takeOverTaskSpace(self.space_id)` + read `task.userPage()`; resolve its label via `await task.tabs()` (match by `targetId`). If unmanaged, `await task.adopt(page, {as})` and **update `self.page_label`** to the resulting permanent label (the human may have opened a new tab ≠ `p1`); if `p1` still exists and is active, keep it. Then `observe()` against the resolved label and return the fresh page dict. `page_label` is persisted to the trace `ego` block so a later `resume` reuses it.
+- `close`: on `done`, spawn `task.finish({keep: []})` (task complete → space closed); on `blocked` or `handoff`, **do not `finish()`** — keep the space so `fbu resume` can continue. The terminal status (`done`/`blocked`/`handoff`) and, when set, the handoff reason are persisted to the trace `ego` block.
 
 ### 4.4 Per-step invocation batching (latency mitigation)
 
@@ -122,12 +168,32 @@ console.log(JSON.stringify({page: info.value, screenshot: shot.data, preparation
 const task = await taskSpace(SPACE_ID);
 const page = task.page(PAGE_LABEL);
 // freshness guard: page.cdp("Runtime.evaluate", {expression: GUARD_EXPR_FOR_ACTION})
-// dispatch: page.cdp("Input.dispatchMouseEvent"/"dispatchKeyEvent"/"insertText", …)  per action.kind
+// dispatch per action.kind per Contract B (§4.1) using shared JS (§4.5):
+//   click/fill → act-dispatch guard (coords) + Input.mousePressed/Released (+ selectAll + insertText for fill)
+//   select     → act-dispatch guard JS sets e.value + dispatchEvent (no CDP Input)
+//   scroll     → scrollPoint JS + Input.mouseWheel
 // re-observe: info = page.cdp("Runtime.evaluate", {expression: READ_STATE, returnByValue: true})
 console.log(JSON.stringify({executed: action.id, page: info.value, ...}));
 ```
 
 `window.__fastBrowserUse` (the snapshot.js cache) persists across A and B because both evaluate in the **same persistent page** owned by ego lite; it resets only on navigation, which snapshot.js re-initializes (`||=`) and `fresh` detects via `page_key`.
+
+**`after_input` across invocations (autocomplete wait).** `browser.observe` consumes `self.after_input` (set by `act` for non-`wait` kinds) to debounce-wait for combobox autocomplete options before reading. In the ego 2-invocation model this is a **Python field on `EgoBrowser`**: invocation B (`act`) sets `self.after_input = action`; the next invocation A (`observe`) reads it and, when set, prepends the bounded autocomplete-wait JS (the `after_input` Promise expression, §4.5) before the normal observe. The field never crosses a process boundary as JS state — it is carried in Python between subprocess calls — so the existing semantics are preserved exactly.
+
+### 4.5 Shared DOM / JS expression module
+
+`snapshot.js` is already shared (read at module load into `READ_STATE`). But `browser.py` currently embeds **six additional inline JS expression strings** as Python f-strings, used by `fresh`/`act`/`observe`. `EgoBrowser` must run the **same** expressions via `page.cdp("Runtime.evaluate")`; duplicating them inline would risk guard divergence and broken freshness semantics. The refactor extracts them into a shared module both backends import:
+
+| Expression | Current location | Used by | Purpose |
+| --- | --- | --- | --- |
+| `MARKER` | `browser.py` module const | `fresh` (no-action branch) | cheap page-identity probe (`state?.marker ?? null`) |
+| `after_input` Promise | `browser.observe` (inline) | `observe` (post-fill) | bounded wait for combobox autocomplete options |
+| scroll fresh-guard | `browser.fresh` (inline f-string) | `fresh` (scroll) | `[pageKey(), scrollGuard(nodes.get(n))]` |
+| click/select/fill fresh-guard | `browser.fresh` (inline f-string) | `fresh` (element) | `[pageKey(), guard(nodes.get(n))]` |
+| `scrollPoint` (act) | `browser_operation` (inline) | `act` (scroll) | resolve a hittable wheel point for a scroll region |
+| act-dispatch guard | `browser_operation` (inline) | `act` (click/fill/select) | resolve center coords; **select** sets value + dispatches input/change in-page |
+
+These move to `fast_browser_use/dom_expressions.py` (Python constants/templates) or a sibling `.js`; `PlaywrightBrowser` and `EgoBrowser` both interpolate node ids / action JSON into them. **Only the Python driver differs** (Playwright: `session.send`; ego: subprocess + `page.cdp`). The `fingerprint()` helper and the `StalePage`/select-`RuntimeError` mapping (§10) are also shared. This keeps both backends byte-identical on DOM semantics and is a prerequisite for `EgoBrowser.act` correctness (Contract B).
 
 ## 5. Group Isolation (Decision 1 = A, refined)
 
@@ -149,12 +215,12 @@ The ego backend is **resumable** across CLI invocations (required for human–AI
 
 - `fbu run '<url>' --goal '...' --browser ego --group team-alpha`:
   - Creates/reuses a task space under group `team-alpha`; prints and persists `spaceId` to the `--trace` file.
-  - Runs the loop. On `done`/`blocked`/`handoff`, exits but **keeps the space** (does not `finish()` on handoff).
+  - Runs the loop. On `done` it `finish()`es and closes the space (task complete). On `blocked` or `handoff` it exits but **keeps the space** for `fbu resume` (no `finish()`); the terminal status and reason are persisted to the trace `ego` block.
 - `fbu resume <spaceId> --browser ego --group team-alpha`:
-  - Calls `takeOverTaskSpace(spaceId)`, adopts `userPage()` if unmanaged, continues the agent loop from the human's current page.
-  - Convenience alias: `fbu run --resume [<trace>]` reads `spaceId` from the trace file's `ego.space_id` (default trace path if omitted) instead of taking it as a positional argument. Both entry points are equivalent.
+  - Calls `takeOverTaskSpace(spaceId)`, resolves the active tab's label (adopting if unmanaged — the human may have switched/opened a tab ≠ `p1`), and continues the agent loop from the human's current page using that label.
+  - Convenience alias: `fbu run --resume [<trace>]` reads `spaceId` and `page_label` from the trace file's `ego` block (default trace path if omitted) instead of taking `spaceId` as a positional argument. Both entry points are equivalent.
 
-The trace JSON gains an `ego` block: `{space_id, group, profile_id, server_name, page_label, handed_off, handoff_reason?}`.
+The trace JSON gains an `ego` block: `{space_id, group, profile_id, server_name, page_label, terminal_status, handed_off, handoff_reason?}` (`terminal_status` ∈ `done`/`blocked`/`handoff`; `handoff_reason` set iff `handed_off`).
 
 ## 7. Human–AI Handoff (Decision 3 = A)
 
@@ -166,7 +232,7 @@ Triggers (gated by `FBU_EGO_HANDOFF=auto` default; `never` disables; `always` ha
 
 On trigger:
 - `agent.py` sets `state["status"] = "handoff"` (new status), records `{reason, url, elapsed_ms}` in a new `state["handoffs"]` list.
-- `EgoBrowser.handoff()` runs `await task.handOff()`.
+- `EgoBrowser.handoff(reason)` runs `await task.handOff()`, reads the current url via `page.info()`/`page.url()`, and returns `{reason, url}` to the agent (which records it in `state["handoffs"]`).
 - The run ends with the trace carrying `spaceId` + handoff reason; the CLI prints a human instruction:
   > `[ego] Handoff (reason: login required). Complete the step in the ego lite browser, then run: fbu resume <spaceId> --browser ego --group <group>`
 - `fbu resume` → `takeOverTaskSpace` → continue.
@@ -180,7 +246,7 @@ fbu run --browser ego --group g1
   └─ EgoBrowser.observe (invocation A) → page dict
        └─ agent.predict (model ~70ms) / agent.act
             └─ EgoBrowser.act (invocation B) → new page dict
-                 └─ if handoff trigger: status=handoff → EgoBrowser.handoff() → exit, keep space
+                 └─ if handoff trigger: status=handoff → EgoBrowser.handoff(reason) → exit, keep space
 fbu resume <spaceId> --browser ego --group g1
   └─ EgoBrowser.takeover → takeOverTaskSpace → userPage → fresh page dict
        └─ continue agent loop from current page
@@ -205,6 +271,10 @@ fbu resume <spaceId> --browser ego --group g1
 | Subprocess returns non-JSON / nodejs exits non-zero | Treat like `StalePage` where recoverable (re-observe once); else `blocked` with the raw stderr in the trace |
 | `page.cdp("Runtime.evaluate")` reports `exceptionDetails` | Map to existing `StalePage("Document changed during evaluation")` — identical to Playwright path |
 | Handoff requested on Playwright backend | `NotImplementedError` with a message pointing to `--browser ego` |
+| `act` select: option disappeared / not confirmed (`Runtime.evaluate` returns null) | `RuntimeError("Dropdown execution was not confirmed; inspect before retry.")` — identical to Playwright `browser_operation` (preserves the existing select-retry contract) |
+| `act` select: evaluate interrupted mid-dispatch (`exceptionDetails`) | `RuntimeError("Dropdown execution was interrupted; inspect before retry.")` — identical to Playwright |
+| ego `close(video_path=…)` with a non-None video_path | `ValueError("ego backend cannot record Playwright video; use --browser playwright for fbu record")` — ego has no Playwright video path |
+| ego receives `viewport`/`headless` kwargs | silently ignored (ego lite owns its window; always headed) — the `make_browser` factory drops them before construction (§4.1) |
 
 `StalePage` semantics are reused unchanged: ego's evaluate exceptions and navigation-during-evaluate produce the same `StalePage` the agent already handles (re-observe, bounded retries).
 
