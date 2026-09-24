@@ -1,59 +1,63 @@
-# POC Findings: ego-browser Backend Feasibility & Cross-Platform Lock-In
+# POC Findings: ego-browser Feasibility & Cross-Platform Browser-Backend Lock-In
 
-Status: Complete · Date: 2026-09-25 · Drives: `docs/ego-backend-goal.md` + `docs/ego-backend-design.md` (pivot pending) · Method: 7 empirical experiments on a running `ego lite` app + Playwright `launch_persistent_context`.
+Status: Complete (revised) · Date: 2026-09-25 · Drives: `docs/ego-backend-goal.md` + `docs/ego-backend-design.md` · Method: 9 empirical experiments on a running `ego lite` app + Playwright `launch`/`launch_persistent_context`.
 
 ## TL;DR
 
-The original design treated ego-browser as **the** path for login-state reuse and human–AI collaboration. POC disproves that framing: ego is **macOS-only**, **inherently multi-second per step** (persistent IPC is blocked), and its group isolation (`--ego-server-name`) needs **Full Access** (fails in sandboxed agent hosts). The Windows+macOS requirement is **not** satisfiable by ego.
+The original design treated ego-browser as **the** path for login-state reuse and human–AI collaboration, then (after POC 1–7) pivoted to a **three-tier** split. Experiments 8–9 (added after a design review) showed that split **over-fragmented**: the default isolated Playwright tier already supports **lightweight per-group isolation** (`storage_state` files) and **in-process-pause collaboration** (headed window + block + continue). The genuinely distinct capabilities are only **cross-process resume + full-profile reuse** (needs `launch_persistent_context`) and **native handOff/takeover UX** (ego only).
 
-The requirement **is** satisfiable cross-platform by **Playwright `launch_persistent_context`** pointing at a user-profile directory: cookies + localStorage survive relaunch on Windows/macOS/Linux (verified). This becomes the **recommended primary backend for authenticated tasks** (`playwright-persistent`); ego is demoted to a **macOS-only advanced opt-in** for the best collaboration UX.
+Locked model: **two backends** — `playwright` (cross-platform Win/macOS/Linux, with an `isolated` default mode and a `persistent` mode via `--profile-dir`) and `ego` (macOS-only advanced opt-in). ego cannot satisfy Windows (macOS-only build), so `playwright` is the cross-platform answer; its `persistent` mode covers full login reuse + cross-process resume, while the default `isolated` mode covers lightweight isolation + in-process-pause collaboration.
 
-## Evidence Matrix (7 experiments)
+## Evidence Matrix (9 experiments)
 
 | # | Hypothesis | Result | Evidence |
 | --- | --- | --- | --- |
-| 1 | ego lite ships a Windows build | **NO** | ego lite site Windows CTA = "Get pinged for Windows" (waitlist, no download); no Linux build. `scripts/install.sh` line 216: `uname -s = Darwin` gate; DMG URLs macos-only (arm64/x64). `index.js` `.exe` matches are acorn-parser `.exec()`, not Windows binaries. |
-| 2 | ego `--ego-server-name` works in sandboxed hosts | **NO** | `Failed to connect to ego_cli bootstrap … cannot connect … from the default agent sandbox. Retry with Full Access or run ego-browser outside the agent sandbox.` Default service (no `--server-name`) works: `SPACE_OK 5`. |
-| 3 | ego nodejs can host a long-lived TCP IPC server (to avoid per-spawn cost) | **NO** | A `net.createServer` script printed nothing (not even the first log line), exit 0 — the embedded runtime does not keep such scripts alive. Combined with the earlier finding that stdin streaming yields empty `data` events, **persistent IPC is blocked**. Per-process spawn (~0.5–1.2 s) is therefore unavoidable per command. |
-| 4 | ego `page.cdp("Runtime.evaluate", READ_STATE)` produces fbu's full page-dict | **YES** | Ran fbu's actual `snapshot.js` via `page.cdp` on `benchmarks/pages/settings.html`: all **14/14** keys present (url,title,language,ready,dialogs,w,h,text,scroll,actions,marker,page_key,guards,omitted_actions); 7 actions (3 click/1 fill/2 select); marker/page_key are arrays; guards is object. **Contract A holds on ego.** |
-| 5 | ego CDP Input domain covers all of fbu's act-dispatch | **MOSTLY** | `Input.dispatchMouseEvent` (mousePressed/Released/wheel), `Input.dispatchKeyEvent` (selectAll), `Emulation.*` all work. **EXCEPT `Input.insertText` → `CdpRequestTimeoutError`**. Workaround: use ego's `page.keyboard.insertText()` instead of raw `Input.insertText` CDP. Contract B mostly shared; one method swap required. |
-| 6 | ego `page.evaluate` preserves `window.*` across calls | **YES** | Counter incremented across two separate `page.evaluate()` calls held its value. fbu's `window.__fastBrowserUse` WeakMap/Map cache pattern is viable on ego. |
-| 7 | Playwright `launch_persistent_context` preserves login state across relaunch | **YES (cross-platform)** | Wrote page-set cookie `fbu_plain` + `localStorage.fbu_ls` in launch 1; relaunched with the same `user_data_dir`; both survived (`document.cookie` shows `fbu_plain=plainval`; localStorage returns `lsval`). Works on Windows/macOS/Linux (Playwright-native). *(Note: `ctx.add_cookies` with httpOnly+secure on example.com did not survive — use page-set or real-profile cookies; the mechanism holds.)* |
+| 1 | ego lite ships a Windows build | **NO** | ego lite site Windows CTA = "Get pinged for Windows" (waitlist, no download); no Linux. `scripts/install.sh` line 216 `uname -s = Darwin` gate; DMG URLs macos-only. `index.js` `.exe` matches are acorn-parser `.exec()`. |
+| 2 | ego `--ego-server-name` works in sandboxed hosts | **NO** | `Failed to connect to ego_cli bootstrap … from the default agent sandbox. Retry with Full Access.` Default service works: `SPACE_OK 5`. |
+| 3 | ego nodejs hosts a long-lived TCP IPC server | **NO** | `net.createServer` script printed nothing (not even the first log), exit 0. Stdin streaming also yields empty `data`. **Persistent IPC blocked** → per-spawn (~0.5–1.2 s) unavoidable → ~2–3 s/step. |
+| 4 | ego `page.cdp("Runtime.evaluate", READ_STATE)` produces fbu's full page-dict | **YES** | Ran fbu's `snapshot.js` via `page.cdp` on `benchmarks/pages/settings.html`: all **14/14** keys; 7 actions; marker/page_key arrays; guards object. **Contract A holds on ego.** |
+| 5 | ego CDP Input domain covers all of fbu's act-dispatch | **MOSTLY** | `Input.dispatchMouseEvent`/`dispatchKeyEvent`/`Emulation.*` work. **`Input.insertText` → `CdpRequestTimeoutError`**; use ego `page.keyboard.insertText()`. Contract B shared except this one swap. |
+| 6 | ego `page.evaluate` preserves `window.*` across calls | **YES** | Counter incremented across two `page.evaluate()` calls held its value. `window.__fastBrowserUse` cache pattern works on ego. |
+| 7 | Playwright `launch_persistent_context` preserves login state across relaunch | **YES (cross-platform)** | Page-set cookie `fbu_plain` + `localStorage.fbu_ls` survived relaunch with the same `user_data_dir`. Win/macOS/Linux (Playwright-native). |
+| 8 | Isolated `new_context(storage_state=<per-group-file>)` gives per-group isolation **without** a persistent dir | **YES** | POC-F: a fresh isolated context loaded `group_session` cookie + `localStorage.group=A` from a per-group file. Lightweight per-group workspace isolation on the default tier. |
+| 9 | Isolated `launch(headless=False)` + in-process block supports human–AI collaboration **without** a persistent profile | **YES** | POC-G: headed window launched; the process can block for the human to act in the visible window, then continue the same process. In-process-pause collaboration on the default tier. |
 
 ## Possibilities Eliminated
 
-- ❌ ego as a **Windows+macOS unified backend** — no Windows build.
-- ❌ ego **low-latency persistent IPC** — `net.createServer` blocked; per-spawn unavoidable → ~2–3 s/step.
-- ❌ ego **group isolation in sandboxed agents** — `--ego-server-name` needs Full Access.
-- ❌ ego **verbatim reuse of fbu `act`-dispatch** — `Input.insertText` must become `keyboard.insertText` (Contract B micro-adjustment).
+- ❌ ego as a **Windows backend** — no Windows build (waitlist).
+- ❌ ego **low-latency persistent IPC** — `net.createServer` blocked (POC #3); per-spawn unavoidable → ~2–3 s/step.
+- ❌ ego **group isolation in sandboxed agents** — `--ego-server-name` needs Full Access (POC #2).
+- ❌ **three-tier split** (isolated / persistent / ego as peers) — over-fragmented: the isolated tier already does lightweight isolation (POC #8) + in-process-pause collaboration (POC #9). `playwright-persistent` is not a separate tier; it is `playwright` + persistent mode.
 
 ## Possibilities Locked In
 
-- ✅ **Playwright `launch_persistent_context(user_data_dir)`** = cross-platform login-state reuse (Win/macOS/Linux), no ego dependency, ~0.5 s/step.
-- ✅ ego can still run fbu's `snapshot.js` + guards verbatim (Contract A); ego stays a **macOS-only** collaboration-UX opt-in.
-- ✅ Shared DOM/guard JS (§4.5 of the design) is sound; only the Python driver and the one `insertText` call differ.
+- ✅ **`playwright` backend, two modes**: `isolated` (default, `launch`+`new_context`, optional per-group `storage_state`) and `persistent` (`launch_persistent_context(user_data_dir)`, per-group dir) — cross-platform Win/macOS/Linux.
+- ✅ **Per-group isolation on BOTH modes**: isolated = `storage_state` file (lightweight, POC #8); persistent = profile dir (full, POC #7).
+- ✅ **Human–AI collaboration on BOTH modes**: in-process pause (headed + block, POC #9) on isolated **and** persistent; **cross-process resume** additionally on persistent (profile persists on disk) and ego (TaskSpace persists).
+- ✅ ego runs fbu's `snapshot.js` + guards verbatim (Contract A); stays a **macOS-only** collaboration-UX opt-in with one Contract-B swap (`Input.insertText` → `keyboard.insertText`).
 
-## Recommended Pivot: Three-Tier `FBU_BROWSER` Backend
+## Recommended Model: Two Backends + Profile Mode
 
-| Tier | Backend | Platforms | Login reuse | Human–AI collaboration | Latency | Role |
+| Backend | Platforms | Profile mode | Per-group isolation | Human–AI collaboration | Latency | Role |
 | --- | --- | --- | --- | --- | --- | --- |
-| Default | `playwright` (current) | Win/macOS/Linux | ❌ isolated empty profile | ❌ one-shot | ~0.5 s/step | benchmarks / CI / non-auth tasks |
-| **Recommended for auth** | `playwright-persistent` (**new**) | **Win/macOS/Linux** | ✅ `launch_persistent_context` at a per-group `user_data_dir` | ✅ headed + pause/resume (state persists on disk across `fbu resume`) | ~0.5 s/step | **primary choice for authenticated tasks** |
-| macOS advanced opt-in | `ego` | **macOS only** | ✅ ego lite real sessions | ✅ native `handOff()` / `takeOverTaskSpace` | ~2–3 s/step | best collaboration UX on macOS |
+| `playwright` (default) | Win/macOS/Linux | `isolated` (`launch`+`new_context`) | `storage_state` file (lightweight, POC #8) | in-process pause (headed, POC #9) | ~0.5 s/step | benchmarks / CI / non-auth / lightweight auth |
+| `playwright` + `--profile-dir` | Win/macOS/Linux | `persistent` (`launch_persistent_context`) | per-group profile dir (full, POC #7) | in-process pause **+ cross-process resume** | ~0.5 s/step | **primary for full login reuse + resume** |
+| `ego` | macOS only | n/a | `--ego-server-name` (Full Access) / default-service task spaces | native `handOff`/`takeOverTaskSpace` | ~2–3 s/step | macOS premium collaboration UX |
 
-### Group isolation (unified cross-platform semantics)
-- `playwright` / `playwright-persistent`: `FBU_PROFILE_DIR` = one dir per group → **cross-platform, no sandbox issue**.
-- `ego`: `--ego-server-name=fbu-<group>` (Full Access required); sandbox fallback = separate task spaces in the default service (weaker isolation).
+### Group isolation (unified, cross-platform on playwright)
+- `playwright` isolated: `~/.fbu/storage/<group>.json` per group (cookies + localStorage).
+- `playwright` persistent: `~/.fbu/profiles/<group>/` per group (full profile).
+- `ego`: `--ego-server-name=fbu-<group>` (Full Access) or default-service task spaces (sandbox fallback).
 
-### Human–AI collaboration (unified cross-platform semantics: `handoff` status + `fbu resume`)
-- `ego` (macOS): native `handOff()` / `takeOverTaskSpace(spaceId)`.
-- `playwright-persistent` (cross-platform): headed run → loop sets `status=handoff`, prints "complete X in the browser window, then `fbu resume`" → `fbu resume` reconnects to the **same profile dir** (state already on disk). Simpler than ego's TaskSpace, but works on **both Windows and macOS**.
+### Human–AI collaboration (unified `handoff` status + `fbu resume`)
+- `playwright` (both modes): `--handoff-mode pause` (default on isolated) = headed window, block in-process, continue same process. `--handoff-mode resume` (default on persistent) = close context, profile retained, `fbu resume` relaunches same dir. (Isolated + resume = `ValueError`: ephemeral context cannot survive process exit.)
+- `ego`: native `handOff()` / `takeOverTaskSpace(spaceId)`.
 
 ## Verdict
 
-> ego-browser is **not** the path to Windows+macOS compatibility. The locked-in best solution is **`playwright-persistent`** (verified cross-platform login reuse + headed pause/resume collaboration) as the primary authenticated-task backend, with ego demoted to a macOS-only advanced collaboration opt-in. The design and goal documents must be rewritten to this three-tier model; fbu's shared `snapshot.js`/guard logic transfers to ego unchanged, with one Contract-B swap (`Input.insertText` → `keyboard.insertText`).
+> Two backends, not three. `playwright` (cross-platform) with an `isolated` default mode and a `persistent` mode (selected by `--profile-dir`) covers Windows+macOS login reuse, per-group isolation, and human–AI collaboration — verified by POC #7/#8/#9. `ego` is a macOS-only advanced opt-in for native handOff/takeover UX, accepting ~2–3 s/step and Full-Access group isolation. fbu's shared `snapshot.js`/guards transfer to ego unchanged with one Contract-B swap (`Input.insertText` → `keyboard.insertText`).
 
 ## Open Items (to confirm before implementation plan)
-- Real-profile reuse path: point `user_data_dir` at a **copy** of the user's actual Chrome/Edge profile (never the live profile — Chromium locks it). Verify cookie/portable-login reuse from a real logged-in profile on the target group's dir.
-- Handoff detector heuristics (login wall / captcha / 2FA patterns) for the `playwright-persistent` pause/resume path.
-- Whether to still ship `ego` backend in v1 or defer until macOS users explicitly request native handoff UX.
+- Real-profile reuse path: point `user_data_dir` at a **copy** of the user's Chrome/Edge profile (never the live profile — Chromium locks it). Verify portable login reuse from a real logged-in profile.
+- Handoff detector heuristics (login wall / captcha / 2FA) and the in-process-pause signal mechanism (stdin line / file sentinel / timeout).
+- Whether to ship `ego` in v1 or defer until macOS users request native handoff UX.
