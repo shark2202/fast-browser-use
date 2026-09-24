@@ -1,53 +1,37 @@
-# Design: ego-browser as an Optional Browser Backend (Group Isolation + Human–AI Collaboration)
+# Design: Three-Tier Browser Backend (playwright / playwright-persistent / ego)
 
-Status: Proposed · Date: 2026-09-25 · Supersedes: none · Related: `docs/design.md`, `fast_browser_use/browser.py`, `fast_browser_use/agent.py`
+Status: Revised (POC-locked) · Date: 2026-09-25 · Supersedes the ego-only design of `bf15a86`/`4e943b7` · Evidence: `docs/ego-backend-poc-findings.md` · Related: `docs/design.md`, `fast_browser_use/browser.py`, `fast_browser_use/agent.py`
 
 ## 1. Goal
 
-Add **ego-browser** as an optional, opt-in browser backend for `fbu`, alongside the existing Playwright backend. The ego backend uniquely supports:
+Ship a **three-tier `FBU_BROWSER` backend** so the **same fbu** supports login-state reuse + human–AI collaboration + group isolation on **Windows + macOS (+ Linux)**:
 
-1. **Group isolation** — multiple independent browser instances/sessions keyed by a group name, so parallel teams or tasks do not share windows, tabs, or login state.
-2. **Human–AI collaboration** — the loop can hand control to a human (for login, 2FA, captcha, paywalls), exit cleanly, and **resume** from where the human left off.
+1. **`playwright`** (default, unchanged) — isolated empty profile; benchmarks / CI / non-auth tasks.
+2. **`playwright-persistent`** (NEW, primary for authenticated tasks) — `launch_persistent_context(user_data_dir)`; cross-platform login reuse + headed pause/resume collaboration.
+3. **`ego`** (macOS-only advanced opt-in) — ego lite real sessions + native `handOff`/`takeOverTaskSpace`; ~2–3 s/step.
 
-Playwright remains the default backend. Existing behavior, benchmarks, and deployments are unchanged when the ego backend is not selected.
+`fbu`'s `snapshot.js`, guards, `actions.py`, `verification.py`, and agent loop are **shared** across all three tiers.
 
-## 2. Background & Justification
+## 2. Background & POC Evidence (locked)
 
-### 2.1 Why ego-browser is feasible (API surface)
+Seven empirical experiments (see `docs/ego-backend-poc-findings.md`) drove this design:
 
-Empirical testing against a running `ego lite` desktop app confirmed ego-browser's `page.cdp()` escape hatch can carry fbu's entire guarded-DOM logic:
-
-| fbu CDP dependency | ego-browser path | Verified |
+| # | Finding | Effect |
 | --- | --- | --- |
-| `Runtime.evaluate(READ_STATE)` (snapshot.js + guards) | `page.cdp("Runtime.evaluate", {expression, returnByValue})` | ✅ returns title, ~4 ms |
-| `Page.captureScreenshot` | `page.cdp("Page.captureScreenshot", {format, quality})` | ✅ 81 KB jpeg |
-| `Input.dispatchMouseEvent` / `dispatchKeyEvent` / `insertText` | `page.cdp("Input.*", …)` | ✅ `{}` ok |
-| `Emulation.setFocusEmulationEnabled` | `page.cdp("Emulation.*", …)` | ✅ ok |
-
-Critically, `page.evaluate()` **preserves `window.*` state across calls** (verified: a counter incremented across two separate `page.evaluate()` calls held its value). This means fbu's `window.__fastBrowserUse` WeakMap/Map cache pattern (the heart of `snapshot.js` node-identity + guard logic) works unchanged through ego-browser. The page dict contract (url/text/actions/scroll/marker/page_key/guards/fingerprint/screenshot/ready) is produced identically because `snapshot.js` runs in the page and returns the same structured value.
-
-`fbu` therefore reuses `snapshot.js`, `actions.py`, `verification.py`, and all guard logic verbatim. Only the **driver** that issues CDP calls changes.
-
-### 2.2 Why ego-browser is not a drop-in (execution model)
-
-| | Playwright (current) | ego-browser |
-| --- | --- | --- |
-| Call path | sync Python `session.send()` → in-process Chromium WebSocket | shell → new Node.js process per `ego-browser nodejs` → IPC → ego lite app |
-| Per-call overhead | sub-millisecond | ~0.5–1.2 s process startup |
-| stdin persistent protocol | n/a (in-process) | **blocked** — embedded node runtime does not wire parent stdin to `process.stdin` (verified: piped input yields empty `data` event) |
-| Platform | Linux headless / Windows / macOS | macOS desktop app required (Linux/Windows unsupported by install path) |
-| Login state | isolated empty profile | **reuses user's real logged-in profiles** (the unique value) |
-
-Because the agent loop interleaves browser calls with **local model inference in Python** (single-token forward pass, ~70 ms), the loop cannot be pre-batched into one script — each action depends on the model's just-computed choice. The ego backend therefore issues **two `ego-browser nodejs` invocations per agent step** (observe+prepare; then act+re-observe), projecting ~2–3 s/step vs Playwright's ~0.5 s. This is the documented, accepted cost of the ego backend, justified by its login-state-reuse and collaboration features.
+| 1 | ego lite is **macOS-only** (Windows=waitlist, no Linux) | ego **cannot** be the Windows backend → `playwright-persistent` is the cross-platform login-reuse path |
+| 2 | ego `--ego-server-name` needs **Full Access** (fails in sandboxed agent hosts) | ego group isolation is macOS + Full-Access only; sandbox fallback = separate default-service task spaces |
+| 3 | ego nodejs **cannot host a listening socket** (`net.createServer` → no output) | persistent IPC blocked → ego per-spawn (~0.5–1.2 s) unavoidable → ~2–3 s/step inherent |
+| 4 | ego `page.cdp("Runtime.evaluate", READ_STATE)` produces **all 14** fbu page-dict keys | Contract A holds on ego; `snapshot.js` reuse is viable |
+| 5 | ego `Input.insertText` CDP **times out**; `page.keyboard.insertText()` works | Contract B shared except one method swap on ego |
+| 6 | ego `page.evaluate` preserves `window.*` across calls | `window.__fastBrowserUse` cache pattern works on ego |
+| 7 | Playwright `launch_persistent_context` persists page-set cookie + localStorage across relaunch | **cross-platform login reuse viable without ego** → `playwright-persistent` tier |
 
 ## 3. Two Orthogonal Axes
 
-`fbu` already uses `FBU_BACKEND` to mean the **inference** backend (`auto`/`mlx`/`torch`, choosing the model). The browser is a **separate, orthogonal axis**, introduced here:
+- `FBU_BROWSER` — `playwright` (default) | `playwright-persistent` | `ego` (browser/driver axis, new)
+- `FBU_BACKEND` — `auto`/`mlx`/`torch` (inference axis, unchanged)
 
-- `FBU_BROWSER` — `playwright` (default) | `ego`
-- `FBU_BACKEND` — unchanged (inference)
-
-The two are independent: any inference backend may run with any browser backend. `--browser` mirrors the env on the CLI, exactly as `--backend` mirrors `FBU_BACKEND`.
+Independent: any inference backend may run with any browser tier. `--browser` mirrors `FBU_BROWSER` on the CLI.
 
 ## 4. Architecture
 
@@ -55,49 +39,47 @@ The two are independent: any inference backend may run with any browser backend.
 agent.py  (unchanged; calls the Browser protocol)
     │
     ▼
-Browser  (abstract protocol: observe / fresh / prepare / act / close  +  handoff / takeover  [ego-only])
-    ├── PlaywrightBrowser   (current browser.py, renamed; default)
-    └── EgoBrowser           (new)
-            │  holds: spaceId, group, profileId?, --ego-server-name, page label
-            │  per step: 2 × ego-browser nodejs subprocess (JS templates)
-            │  injects fbu's existing snapshot.js via page.cdp("Runtime.evaluate")
+Browser protocol  (observe / fresh / prepare / act / close  +  handoff / takeover)
+    ├── PlaywrightBrowser          (current browser.py, renamed; default; cross-platform)
+    ├── PlaywrightPersistentBrowser (NEW; launch_persistent_context; primary for auth; cross-platform)
+    └── EgoBrowser                  (macOS-only opt-in; 2× ego-browser nodejs per step)
+            │  injects fbu's snapshot.js via page.cdp("Runtime.evaluate")
             ▼
-        ego lite desktop app (must be running)
+        ego lite desktop app (macOS, running, Full Access for --ego-server-name)
 ```
 
-### 4.1 Browser protocol
+All three tiers consume the shared DOM/JS module (§4.5) and produce the identical page-dict contract (Contract A).
 
-The abstract surface is the **semantic** operations `agent.py` already calls — not the CDP plumbing (`call`/`evaluate`/`session`), which is Playwright-specific:
+### 4.1 Browser protocol, factory, and contracts
 
 ```python
 class Browser(Protocol):
-    def observe(self, screenshot: bool = True) -> dict: ...        # returns page dict (see contract A)
+    def observe(self, screenshot: bool = True) -> dict: ...        # page dict (Contract A)
     # fresh has THREE branches, each its own JS expression (see §4.5): action=None → MARKER only;
     # action.kind=='scroll' → pageKey+scrollGuard; action.kind in {click,select,fill} → pageKey+guard.
     def fresh(self, page: dict, action: dict | None = None) -> bool: ...
     def prepare(self, page: dict, *, screenshot: bool = False) -> dict: ...
-    def act(self, action: dict, page: dict, text: str | None = None) -> dict: ...   # action: see contract B
+    def act(self, action: dict, page: dict, text: str | None = None) -> dict: ...   # action: Contract B
     def close(self, *, video_path: str | None = None) -> None: ...
-    # ego-only collaboration hooks (Playwright raises NotImplementedError; only EgoBrowser implements).
-    # reason is determined by the harness detector (§7), passed in; url is read from ego page.info().
-    def handoff(self, reason: str) -> dict: ...    # runs task.handOff(); returns {reason, url}
-    def takeover(self) -> dict: ...                # uses self.space_id; returns fresh page dict
+    # Collaboration hooks. Persistent uses headed pause/resume; ego uses native handOff/takeover;
+    # isolated Playwright raises NotImplementedError (one-shot, no persisted session).
+    def handoff(self, reason: str) -> dict: ...    # returns {reason, url}
+    def takeover(self) -> dict: ...                # uses persisted session id; returns fresh page dict
     @property
-    def session_id(self) -> str | None: ...        # ego: spaceId; playwright: None
+    def session_id(self) -> str | None: ...         # persistent: profile_dir; ego: spaceId; isolated: None
 ```
 
-**Construction & selection contract.** The two backends have **different constructors** (Playwright: `viewport`/`headless`/`video_dir`; ego: `group`/`profile_id`/`space_id`/`handoff_mode`), so `agent.py` never calls a backend constructor directly. A module-level factory selects and constructs:
+**Construction & selection contract.** Tiers have different constructors, so `agent.py` never calls a backend constructor directly. A module-level factory selects and constructs:
 
 ```python
 def make_browser(url: str, *, browser: str | None = None, **opts) -> Browser:
-    # browser or FBU_BROWSER env (default "playwright"); opts passed through per backend.
-    # Playwright: opts = {video_dir, viewport, headless}; ignores group/profile/space_id/handoff_mode.
-    # Ego:       opts = {group, profile_id, space_id, handoff_mode}; ignores viewport/headless/video_dir
-    #            (raises on video_dir — ego cannot record Playwright video; see §10).
+    # browser or FBU_BROWSER env (default "playwright"); opts filtered per tier:
+    #   playwright:           {video_dir, viewport, headless}; ignores group/profile_dir/space_id/handoff_mode
+    #   playwright-persistent:{profile_dir, group, video_dir?, viewport?, headless=False for handoff, handoff_mode}
+    #   ego:                  {group, profile_id?, space_id?, handoff_mode}; ignores viewport/headless/video_dir
 ```
-`agent.py` calls `make_browser(url, browser=…, **resolved_opts)`; the resolved opts are filtered by the factory so each backend receives only its kwargs.
 
-**Contract A — page dict.** Produced identically by both backends (same `snapshot.js` evaluated via `Runtime.evaluate`; screenshot/fingerprint/preparation added by the driver). `EgoBrowser` produces it through `page.cdp("Runtime.evaluate", …)`, exactly as Playwright does through `session.send`. Every key must match:
+**Contract A — page dict.** Produced identically by all tiers (same `snapshot.js` via `Runtime.evaluate`; screenshot/fingerprint/preparation added by the driver). Every key must match:
 
 | Key | Type | Producer | Consumer |
 | --- | --- | --- | --- |
@@ -118,188 +100,173 @@ def make_browser(url: str, *, browser: str | None = None, **opts) -> Browser:
 | `screenshot` | str(b64) | driver (`Page.captureScreenshot`, jpeg q72) | agent/recording |
 | `preparation` | dict | browser.prepare (latency_ms/samples/settled) | trace (observations) |
 
-`EgoBrowser` MUST emit all 16 rows identically; missing `title`/`dialogs`/`language` would break the model prompt and the handoff detector.
+**Contract B — action dict.** Each `page["actions"]` entry is one of four variants; `act()` dispatches per variant. `rect` present on element actions but stripped from `marker`; `id` assigned by snapshot.js after splice (`e1..eN`, `scroll_*`, `wait`):
 
-**Contract B — action dict.** Each entry in `page["actions"]` is one of four heterogeneous variants; `act()` dispatches per variant. `rect` is present on element actions but stripped from `marker`. `id` is assigned by snapshot.js after splice (`e1..eN`, `scroll_*`, `wait`):
-
-| kind | distinguishing fields | execution path (identical on both backends) |
+| kind | distinguishing fields | execution path (identical across tiers, except the ego note) |
 | --- | --- | --- |
-| `click` / `fill` | `node:int`, `role`, `value`, `rect` | resolve center `{x,y}` via the act-dispatch guard JS; `Input.dispatchMouseEvent` mousePressed+Released; if `fill`: then selectAll (`KeyA` + `commands:["selectAll"]`, mac modifiers=4 else 2) + `Input.insertText(text)` |
+| `click` / `fill` | `node:int`, `role`, `value`, `rect` | resolve center `{x,y}` via the act-dispatch guard JS; `Input.dispatchMouseEvent` mousePressed+Released; if `fill`: selectAll (`KeyA` + `commands:["selectAll"]`, mac modifiers=4 else 2) + insert text (isolated/persistent: `Input.insertText`; **ego: `page.keyboard.insertText(text)`** — raw `Input.insertText` CDP times out per POC #5) |
 | `select` | `node:int`, `value`, `role='combobox'` | **page-side JS, NOT CDP Input**: validate option exists & enabled; `e.value=action.value`; `dispatchEvent(input)` + `dispatchEvent(change)`; return `{x,y}` (coords unused). Failure → `RuntimeError("Dropdown execution was not confirmed")` |
 | `scroll` | `node:int\|None`, `delta:int`, `scroll_state` | resolve scroll point via `scrollPoint` JS (`document.scrollingElement` when node=None); `Input.dispatchMouseEvent(type="mouseWheel", **point, deltaX=0, deltaY=delta)` |
 | `wait` | (no `node`) | Python `time.sleep(0.1)` (no CDP) |
 
-`EgoBrowser.act` reimplements this dispatch via `page.cdp("Input.*")` and `page.cdp("Runtime.evaluate")` using the **shared JS expressions** in §4.5 — it does **not** reuse `browser_operation`'s Python (which is Playwright-`session`-specific).
+### 4.2 PlaywrightBrowser (default, cross-platform)
 
-### 4.2 PlaywrightBrowser
+`fast_browser_use/browser.py` renamed to `PlaywrightBrowser`, implements the protocol. **No behavioral change.** `call`/`evaluate`/`browser_operation` stay private. `handoff`/`takeover` raise `NotImplementedError` (one-shot; no persisted session). `session_id` = `None`.
 
-`fast_browser_use/browser.py` is renamed to `PlaywrightBrowser` and made to implement the protocol. No behavioral change. `call`/`evaluate`/`browser_operation` stay as private helpers. `handoff`/`takeover` raise `NotImplementedError` (Playwright has no persistent session to hand off; one-shot process semantics remain).
+### 4.3 PlaywrightPersistentBrowser (NEW — cross-platform login reuse + collaboration)
 
-### 4.3 EgoBrowser
+This is the **recommended tier for authenticated tasks on Windows + macOS + Linux**. It uses `chromium.launch_persistent_context(user_data_dir=…)` instead of `launch()` + `new_context()`:
 
-Holds per-session state and drives ego via subprocess. Key fields: `group` (str, default `default`), `space_id` (int, None until created/resumed), `page_label` (default `"p1"`), `profile_id` (optional), `server_name` (derived `fbu-<group>`).
+- **Login reuse**: `user_data_dir` per group (`FBU_PROFILE_DIR`, default `~/.fbu/profiles/<group>`). Pointing it at a **copy** of the user's real Chrome/Edge profile yields an already-logged-in session (POC #7). **Never** the live profile — Chromium locks it.
+- **CDP**: a persistent context still exposes `new_cdp_session(page)`, so `observe`/`fresh`/`prepare`/`act` run the **same** `Runtime.evaluate`/`Page.captureScreenshot`/`Input.*`/`Emulation.*` calls as `PlaywrightBrowser` — Contract A/B are byte-identical (no `insertText` swap; that is ego-only).
+- **Headed for handoff**: `FBU_HANDOFF=auto` forces `headless=False` so the human can see and interact. The window persists across `fbu resume` because the profile dir persists.
+- **`handoff(reason)`**: set `status=handoff`, print the resume instruction, close the context (the profile persists on disk). No `taskSpace`/`finish` — the "session" is the profile dir.
+- **`takeover()`**: relaunch `launch_persistent_context(same user_data_dir)`; the page state (cookies/localStorage/scroll) survived; re-`observe`. `session_id` = the profile dir path.
+- **`close(video_path)`**: saves Playwright video as today.
 
-**Lifecycle:**
-- Construct: store config; do NOT spawn yet (lazy).
-- First `observe`: spawn a "setup" invocation that creates/reuses `taskSpace(name, {profileId?})` under `--ego-server-name=fbu-<group>`, navigates `p1` to the URL, returns `spaceId` (persisted to trace).
-- Each `observe`/`fresh`/`prepare`/`act`: spawn a bounded nodejs invocation running a JS template (see 4.4), parse JSON from stdout.
-- `handoff`: spawn `task.handOff()` invocation; set internal `handed_off=True`; return `{reason, url}`.
-- `takeover`: spawn `takeOverTaskSpace(self.space_id)` + read `task.userPage()`; resolve its label via `await task.tabs()` (match by `targetId`). If unmanaged, `await task.adopt(page, {as})` and **update `self.page_label`** to the resulting permanent label (the human may have opened a new tab ≠ `p1`); if `p1` still exists and is active, keep it. Then `observe()` against the resolved label and return the fresh page dict. `page_label` is persisted to the trace `ego` block so a later `resume` reuses it.
-- `close`: on `done`, spawn `task.finish({keep: []})` (task complete → space closed); on `blocked` or `handoff`, **do not `finish()`** — keep the space so `fbu resume` can continue. The terminal status (`done`/`blocked`/`handoff`) and, when set, the handoff reason are persisted to the trace `ego` block.
+### 4.4 EgoBrowser (macOS-only advanced opt-in)
 
-### 4.4 Per-step invocation batching (latency mitigation)
+Holds: `group` (default `default`), `space_id` (None until created/resumed), `page_label` (default `p1`), `profile_id`? (optional), `server_name` (`fbu-<group>`). The ego lite app must be running; **`--ego-server-name` requires Full Access** (fails in sandboxed hosts — POC #2; sandbox fallback uses the default service with separate task spaces).
 
-Stdin streaming is blocked (§2.2), so each step uses two invocations:
+Stdin streaming is blocked and `net.createServer` is blocked (POC #3), so each agent step uses **two `ego-browser nodejs` invocations** (observe+prepare; then act+re-observe):
 
-**Invocation A — observe+prepare** (JS template, returns page dict):
-```js
-const task = await taskSpace(SPACE_ID);                 // resume
-const page = task.page(PAGE_LABEL);                    // or userPage() after takeover
-// settle loop (bounded): compare marker across repeated page.cdp("Runtime.evaluate", READ_STATE)
-// then: info = page.cdp("Runtime.evaluate", {expression: READ_STATE, returnByValue: true})
-//       shot = page.cdp("Page.captureScreenshot", {format:"jpeg", quality:72})
-console.log(JSON.stringify({page: info.value, screenshot: shot.data, preparation:{...}}));
-```
+- **Invocation A — observe+prepare** (returns page dict): `taskSpace(space_id)` → `page(page_label)` → settle loop comparing `marker` across repeated `page.cdp("Runtime.evaluate", READ_STATE)` → `info = page.cdp("Runtime.evaluate", {expression: READ_STATE, returnByValue:true})` → `page.cdp("Page.captureScreenshot", {format:"jpeg",quality:72})`.
+- **Python: model inference** (`choose` ~70 ms; `field_text` when typing).
+- **Invocation B — act+re-observe** (returns new page dict): freshness guard per Contract B branch via `page.cdp("Runtime.evaluate", GUARD_EXPR)` → dispatch via `page.cdp("Input.*")` (and `page.keyboard.insertText(text)` for `fill`, **not** `Input.insertText`) → re-observe.
 
-**Python: model inference** (`choose`, ~70 ms; `field_text` when typing).
+`window.__fastBrowserUse` persists across A and B (same persistent page in ego lite; resets on navigation, re-init by `||=`, detected by `page_key`). `after_input` is a Python field on `EgoBrowser` (set in B, consumed in next A) — it never crosses a process boundary as JS state.
 
-**Invocation B — act+re-observe** (JS template, returns new page dict):
-```js
-const task = await taskSpace(SPACE_ID);
-const page = task.page(PAGE_LABEL);
-// freshness guard: page.cdp("Runtime.evaluate", {expression: GUARD_EXPR_FOR_ACTION})
-// dispatch per action.kind per Contract B (§4.1) using shared JS (§4.5):
-//   click/fill → act-dispatch guard (coords) + Input.mousePressed/Released (+ selectAll + insertText for fill)
-//   select     → act-dispatch guard JS sets e.value + dispatchEvent (no CDP Input)
-//   scroll     → scrollPoint JS + Input.mouseWheel
-// re-observe: info = page.cdp("Runtime.evaluate", {expression: READ_STATE, returnByValue: true})
-console.log(JSON.stringify({executed: action.id, page: info.value, ...}));
-```
-
-`window.__fastBrowserUse` (the snapshot.js cache) persists across A and B because both evaluate in the **same persistent page** owned by ego lite; it resets only on navigation, which snapshot.js re-initializes (`||=`) and `fresh` detects via `page_key`.
-
-**`after_input` across invocations (autocomplete wait).** `browser.observe` consumes `self.after_input` (set by `act` for non-`wait` kinds) to debounce-wait for combobox autocomplete options before reading. In the ego 2-invocation model this is a **Python field on `EgoBrowser`**: invocation B (`act`) sets `self.after_input = action`; the next invocation A (`observe`) reads it and, when set, prepends the bounded autocomplete-wait JS (the `after_input` Promise expression, §4.5) before the normal observe. The field never crosses a process boundary as JS state — it is carried in Python between subprocess calls — so the existing semantics are preserved exactly.
+- **`handoff(reason)`**: `await task.handOff()`, read `page.url()`, return `{reason, url}`; keep the space.
+- **`takeover()`**: `takeOverTaskSpace(self.space_id)` → `task.userPage()` → resolve label via `await task.tabs()` (match `targetId`), `await task.adopt(page,{as})` if unmanaged and **update `self.page_label`** (the human may have switched/opened a tab ≠ `p1`); then `observe()` and return the fresh page dict. `page_label` is persisted to the trace `ego` block.
+- **`close`**: on `done`, `task.finish({keep:[]})`; on `blocked`/`handoff`, keep the space for `fbu resume`. `terminal_status` + `handoff_reason` persisted to the trace.
 
 ### 4.5 Shared DOM / JS expression module
 
-`snapshot.js` is already shared (read at module load into `READ_STATE`). But `browser.py` currently embeds **six additional inline JS expression strings** as Python f-strings, used by `fresh`/`act`/`observe`. `EgoBrowser` must run the **same** expressions via `page.cdp("Runtime.evaluate")`; duplicating them inline would risk guard divergence and broken freshness semantics. The refactor extracts them into a shared module both backends import:
+`snapshot.js` is already shared (read at module load into `READ_STATE`). `browser.py` embeds **six additional inline JS expression strings** as Python f-strings used by `fresh`/`act`/`observe`. All three tiers must run the **same** expressions; extracting them avoids drift:
 
 | Expression | Current location | Used by | Purpose |
 | --- | --- | --- | --- |
 | `MARKER` | `browser.py` module const | `fresh` (no-action branch) | cheap page-identity probe (`state?.marker ?? null`) |
-| `after_input` Promise | `browser.observe` (inline) | `observe` (post-fill) | bounded wait for combobox autocomplete options |
+| `after_input` Promise | `browser.observe` (inline) | `observe` (post-fill) | bounded wait for combobox autocomplete |
 | scroll fresh-guard | `browser.fresh` (inline f-string) | `fresh` (scroll) | `[pageKey(), scrollGuard(nodes.get(n))]` |
-| click/select/fill fresh-guard | `browser.fresh` (inline f-string) | `fresh` (element) | `[pageKey(), guard(nodes.get(n))]` |
-| `scrollPoint` (act) | `browser_operation` (inline) | `act` (scroll) | resolve a hittable wheel point for a scroll region |
+| click/select/fill fresh-guard | `browser.fresh` (inline) | `fresh` (element) | `[pageKey(), guard(nodes.get(n))]` |
+| `scrollPoint` (act) | `browser_operation` (inline) | `act` (scroll) | resolve a hittable wheel point |
 | act-dispatch guard | `browser_operation` (inline) | `act` (click/fill/select) | resolve center coords; **select** sets value + dispatches input/change in-page |
 
-These move to `fast_browser_use/dom_expressions.py` (Python constants/templates) or a sibling `.js`; `PlaywrightBrowser` and `EgoBrowser` both interpolate node ids / action JSON into them. **Only the Python driver differs** (Playwright: `session.send`; ego: subprocess + `page.cdp`). The `fingerprint()` helper and the `StalePage`/select-`RuntimeError` mapping (§10) are also shared. This keeps both backends byte-identical on DOM semantics and is a prerequisite for `EgoBrowser.act` correctness (Contract B).
+These move to `fast_browser_use/dom_expressions.py` (Python constants/templates); all tiers interpolate node ids / action JSON. **Only the Python driver differs** (isolated/persistent: `session.send`; ego: subprocess + `page.cdp`), and on ego the final `fill` text insert uses `page.keyboard.insertText`. `fingerprint()` and the `StalePage`/select-`RuntimeError` mapping (§10) are also shared.
 
-## 5. Group Isolation (Decision 1 = A, refined)
+## 5. Group Isolation
 
-Isolation has two layers; both are explicitly requested by the user:
+Unified cross-platform semantics — **one isolated profile per group**:
 
-- **Primary axis — `--ego-server-name=fbu-<group>`** (always applied). Each group is a **separate named browser service** in ego lite = separate windows, separate process context. Fully CLI-controllable; no profile management needed. This is the default group boundary.
-- **Secondary axis — `profileId`** (opt-in via `FBU_EGO_PROFILE=<id>` or `--profile`). Adds cookie-jar/cache isolation within a service. The ego-browser Skill cautions against inspecting/selecting profiles unless explicitly requested; fbu treats it as an advanced opt-in. A group may pin one profile; without it, ego lite's default profile applies.
+- **`playwright` / `playwright-persistent`**: `FBU_PROFILE_DIR` (default `~/.fbu/profiles/<group>`). One directory per group → separate cookie jars, caches, and (persistent) login state. **Cross-platform, no sandbox issue.** Different groups never share state.
+- **`ego`**: `--ego-server-name=fbu-<group>` (separate ego lite named service = separate windows/process context) **requires Full Access**; optional `FBU_EGO_PROFILE=<id>` adds cookie-jar isolation (ego Skill cautions against programmatic profile selection, so it is opt-in). **Sandbox fallback**: separate task spaces in the default service (weaker — shared profile) when Full Access is unavailable.
 
-Configuration:
-- `FBU_EGO_GROUP=<name>` (default `default`) → `--ego-server-name=fbu-<name>`
-- `FBU_EGO_PROFILE=<id>` (optional) → `taskSpace(name, {profileId: id})`
-- `--group` / `--profile` mirror on the `run` and `resume` CLI subcommands.
+Configuration: `FBU_BROWSER`, `FBU_EGO_GROUP`/`FBU_PROFILE_DIR` (per tier), `FBU_EGO_PROFILE` (ego, advanced), `FBU_HANDOFF`. `--browser`/`--group`/`--profile-dir`/`--handoff` mirror on `run`/`resume`.
 
-Same group across runs → same `--ego-server-name` → same task space reused (via persisted `spaceId` in the trace). Different groups → fully isolated services.
+## 6. Resumable Session Model
 
-## 6. Resumable Session Model (Decision 2 = accepted)
+The persistent and ego tiers are **resumable** across CLI invocations (required for human–AI collaboration). The isolated `playwright` tier remains one-shot.
 
-The ego backend is **resumable** across CLI invocations (required for human–AI collaboration). Playwright remains one-shot.
+- `fbu run '<url>' --goal '…' --browser playwright-persistent --group personal`:
+  - Launches `launch_persistent_context(~/.fbu/profiles/personal)`; persists the profile dir to the `--trace` file's `session` block (`{tier, group, profile_dir, terminal_status, handoff_reason?}`).
+  - On `done` it closes the context (profile retained on disk for reuse). On `blocked`/`handoff` it exits **keeping the profile** for `fbu resume`.
+- `fbu resume --browser playwright-persistent --group personal` (or `fbu run --resume [<trace>]` reading the trace's `session` block):
+  - Re-launches `launch_persistent_context(same profile_dir)`; cookies/localStorage survived; continues from the human's page. (ego: `takeOverTaskSpace(space_id)` + `userPage()`, resolving/adopting the label; see §4.4.)
+- `fbu run --browser ego --group g1`: persists `spaceId` to the trace's `ego` block `{space_id, group, profile_id, server_name, page_label, terminal_status, handed_off, handoff_reason?}`.
 
-- `fbu run '<url>' --goal '...' --browser ego --group team-alpha`:
-  - Creates/reuses a task space under group `team-alpha`; prints and persists `spaceId` to the `--trace` file.
-  - Runs the loop. On `done` it `finish()`es and closes the space (task complete). On `blocked` or `handoff` it exits but **keeps the space** for `fbu resume` (no `finish()`); the terminal status and reason are persisted to the trace `ego` block.
-- `fbu resume <spaceId> --browser ego --group team-alpha`:
-  - Calls `takeOverTaskSpace(spaceId)`, resolves the active tab's label (adopting if unmanaged — the human may have switched/opened a tab ≠ `p1`), and continues the agent loop from the human's current page using that label.
-  - Convenience alias: `fbu run --resume [<trace>]` reads `spaceId` and `page_label` from the trace file's `ego` block (default trace path if omitted) instead of taking `spaceId` as a positional argument. Both entry points are equivalent.
+## 7. Human–AI Handoff
 
-The trace JSON gains an `ego` block: `{space_id, group, profile_id, server_name, page_label, terminal_status, handed_off, handoff_reason?}` (`terminal_status` ∈ `done`/`blocked`/`handoff`; `handoff_reason` set iff `handed_off`).
+The model never selects a synthetic `HANDOFF` action — that would break zero-hallucination. Handoff is **harness-triggered**, gated by `FBU_HANDOFF=auto` (default; `never` disables; `always` hands off at the first observe):
 
-## 7. Human–AI Handoff (Decision 3 = A)
+1. **Heuristic detection** during `observe`/`prepare`: lightweight patterns over `page["text"]`/`url`/`actions`/`dialogs` indicating a login form (password field + submit), captcha, 2FA, or auth-redirect. Explicit, overridable, no model call.
+2. **`BLOCKED` status** from the agent loop (3 repeated no-change actions) → handoff with reason `blocked-no-progress`.
 
-The model never selects a synthetic `HANDOFF` action — that would violate fbu's zero-hallucination principle (the model only chooses among observed DOM elements). Handoff is **triggered by the harness**, never by the model.
+On trigger: `agent.py` sets `state["status"]="handoff"`, records `{reason, url, elapsed_ms}` in `state["handoffs"]`; `browser.handoff(reason)` runs the tier-specific handoff (persistent: close context, profile retained; ego: `task.handOff()`); the CLI prints the resume instruction; the run ends with the trace carrying the session id + reason. `fbu resume` → `browser.takeover()` → continue.
 
-Triggers (gated by `FBU_EGO_HANDOFF=auto` default; `never` disables; `always` hands off at the first observe):
-1. **Heuristic detection** during `observe`/`prepare`: lightweight patterns over `page["text"]`/`url`/`actions` indicating a login form (password field + submit), a captcha (iframe/signatures), a 2FA challenge, or an auth-redirect to an IdP. The detector is a small, explicit, overridable module (no model call) so it stays transparent and testable.
-2. **`BLOCKED` status** from the agent loop (e.g., 3 repeated no-change actions) → handoff with reason `blocked-no-progress`.
+`PlaywrightBrowser.handoff()` raises `NotImplementedError` (one-shot; point at `--browser playwright-persistent` or `ego`).
 
-On trigger:
-- `agent.py` sets `state["status"] = "handoff"` (new status), records `{reason, url, elapsed_ms}` in a new `state["handoffs"]` list.
-- `EgoBrowser.handoff(reason)` runs `await task.handOff()`, reads the current url via `page.info()`/`page.url()`, and returns `{reason, url}` to the agent (which records it in `state["handoffs"]`).
-- The run ends with the trace carrying `spaceId` + handoff reason; the CLI prints a human instruction:
-  > `[ego] Handoff (reason: login required). Complete the step in the ego lite browser, then run: fbu resume <spaceId> --browser ego --group <group>`
-- `fbu resume` → `takeOverTaskSpace` → continue.
-
-Handoff is an ego-only capability; `PlaywrightBrowser.handoff()` raises `NotImplementedError` (Playwright cannot persist a session for resume).
-
-## 8. Data Flow (resumable + handoff)
+## 8. Data Flow
 
 ```
+fbu run --browser playwright-persistent --group g1
+  └─ PlaywrightPersistentBrowser.observe → page dict
+       └─ agent.predict (model ~70ms) / agent.act
+            └─ PlaywrightPersistentBrowser.act → new page dict
+                 └─ if handoff: status=handoff → close context (profile retained) → exit
+fbu resume --browser playwright-persistent --group g1
+  └─ relaunch launch_persistent_context(same profile_dir) → takeover → fresh page dict
+       └─ continue agent loop from current page
+
+# ego path (macOS, Full Access for --server-name):
 fbu run --browser ego --group g1
   └─ EgoBrowser.observe (invocation A) → page dict
-       └─ agent.predict (model ~70ms) / agent.act
+       └─ agent.predict / agent.act
             └─ EgoBrowser.act (invocation B) → new page dict
-                 └─ if handoff trigger: status=handoff → EgoBrowser.handoff(reason) → exit, keep space
+                 └─ if handoff: task.handOff() → exit, keep space
 fbu resume <spaceId> --browser ego --group g1
   └─ EgoBrowser.takeover → takeOverTaskSpace → userPage → fresh page dict
-       └─ continue agent loop from current page
 ```
 
 ## 9. CLI Surface
 
 `fast_browser_use/cli.py` gains:
 
-- Global/`run` args: `--browser {playwright,ego}` (default `playwright`, mirrors `FBU_BROWSER`), `--group <name>` (ego), `--profile <id>` (ego, advanced), `--handoff {auto,never,always}` (ego, default `auto`).
-- New subcommand `resume`: `fbu resume <spaceId> --browser ego --group <name>` (also `--resume` on `run` to read `spaceId` from a trace file).
-- `record` and `serve` keep Playwright-only semantics; `--browser ego` there raises a clear error (ego backend does not support deterministic headless recording — it depends on the running desktop app).
-
-`fbu install-browser` stays Playwright-only; a `fbu doctor`-style preflight for ego (`ego lite` running? `ego-browser` on PATH? group service connectable?) is added to give actionable errors.
+- `--browser {playwright,playwright-persistent,ego}` (default `playwright`, mirrors `FBU_BROWSER`).
+- `--group <name>` (all tiers; selects the profile dir / ego server-name).
+- `--profile-dir <path>` (persistent/ego; overrides the default per-group dir).
+- `--handoff {auto,never,always}` (default `auto`; persistent forces headed).
+- New subcommand `resume`: `fbu resume [--browser B] [--group G] [<spaceId|trace>]` (ego takes a `spaceId`; persistent/ego both accept `--resume` on `run` reading the trace's `session`/`ego` block).
+- `record` and `serve` keep isolated-`playwright`-only semantics; `--browser` other than `playwright` there raises a clear error.
+- `fbu doctor`-style preflight: ego checks (`ego lite` running? `ego-browser` on PATH? Full Access for `--server-name`? macOS only?) and persistent checks (profile dir writable? not a live Chrome profile?).
 
 ## 10. Error Handling
 
 | Failure | Behavior |
 | --- | --- |
-| ego lite app not running / `ego-browser` not on PATH | `EgoBrowser` construction preflight fails fast with the install.md remediation link |
-| `taskSpace`/`takeOverTaskSpace` rejected (user didn't approve) | Surface the ego message; status `blocked`; do not retry/route around (per ego Skill) |
-| Subprocess returns non-JSON / nodejs exits non-zero | Treat like `StalePage` where recoverable (re-observe once); else `blocked` with the raw stderr in the trace |
-| `page.cdp("Runtime.evaluate")` reports `exceptionDetails` | Map to existing `StalePage("Document changed during evaluation")` — identical to Playwright path |
-| Handoff requested on Playwright backend | `NotImplementedError` with a message pointing to `--browser ego` |
-| `act` select: option disappeared / not confirmed (`Runtime.evaluate` returns null) | `RuntimeError("Dropdown execution was not confirmed; inspect before retry.")` — identical to Playwright `browser_operation` (preserves the existing select-retry contract) |
-| `act` select: evaluate interrupted mid-dispatch (`exceptionDetails`) | `RuntimeError("Dropdown execution was interrupted; inspect before retry.")` — identical to Playwright |
-| ego `close(video_path=…)` with a non-None video_path | `ValueError("ego backend cannot record Playwright video; use --browser playwright for fbu record")` — ego has no Playwright video path |
-| ego receives `viewport`/`headless` kwargs | silently ignored (ego lite owns its window; always headed) — the `make_browser` factory drops them before construction (§4.1) |
+| ego lite not running / `ego-browser` not on PATH / not macOS | `EgoBrowser` preflight fails fast with the install.md remediation link |
+| ego `--ego-server-name` in a sandboxed host | clear message: needs Full Access or non-sandboxed shell; offer sandbox fallback (separate default-service task spaces) |
+| `taskSpace`/`takeOverTaskSpace` rejected (user didn't approve) | surface the ego message; status `blocked`; do not retry/route around (per ego Skill) |
+| ego subprocess non-JSON / non-zero exit | `StalePage` if recoverable (re-observe once); else `blocked` with raw stderr in the trace |
+| `Runtime.evaluate` `exceptionDetails` | `StalePage("Document changed during evaluation")` — identical to Playwright (all tiers) |
+| `act` select: option gone (`Runtime.evaluate` null) | `RuntimeError("Dropdown execution was not confirmed; inspect before retry.")` (shared) |
+| `act` select: evaluate interrupted (`exceptionDetails`) | `RuntimeError("Dropdown execution was interrupted; inspect before retry.")` (shared) |
+| ego `act` fill: `Input.insertText` timeout | fall back to `page.keyboard.insertText(text)` (POC #5; the ego driver does this by default) |
+| persistent: `user_data_dir` is a live Chrome profile | `ValueError` at preflight (Chromium locks it; use a copy or a dedicated dir) |
+| ego `close(video_path=…)` non-None | `ValueError("ego backend cannot record Playwright video")` |
+| ego receives `viewport`/`headless` kwargs | silently ignored (ego lite owns its window); `make_browser` drops them |
+| handoff requested on isolated `playwright` | `NotImplementedError` → point at `--browser playwright-persistent` or `ego` |
 
-`StalePage` semantics are reused unchanged: ego's evaluate exceptions and navigation-during-evaluate produce the same `StalePage` the agent already handles (re-observe, bounded retries).
+`StalePage` semantics are reused unchanged across all tiers.
 
 ## 11. Testing Strategy
 
-- `test_browser.py` — existing; verify `PlaywrightBrowser` rename keeps behavior (no regressions).
+- `test_browser.py` — `PlaywrightBrowser` rename keeps behavior (no regressions).
+- `test_persistent_browser.py` (new):
+  - Unit: profile-dir resolution per group; handoff detector over fixture `page` dicts; trace `session` block round-trip.
+  - Live (`@pytest.mark.persistent`, skip unless `FBU_PERSISTENT_LIVE=1`): cookie+localStorage survive relaunch on the target platform (re-verifies POC #7); headed handoff→resume reconnects the same profile.
 - `test_ego_backend.py` (new):
-  - Unit: JS template generation (snapshot.js injection, guard expression per action kind, settle-loop boundaries) — pure string construction, no live browser.
-  - Unit: handoff detector (login/captcha/2FA patterns) over fixture `page` dicts.
-  - Unit: group→server-name/profile mapping; trace `ego` block round-trip.
-  - Integration (marked `@pytest.mark.ego`, skipped unless `FBU_EGO_LIVE=1` and app running): real `ego-browser nodejs` round-trip — observe→act→re-observe on `example.com`, plus a handoff→resume sequence. These reproduce the §2.1 empirical checks as regression tests.
-- `test_cli.py` — `--browser`, `--group`, `resume` arg parsing and the preflight error path.
-- `test_agent.py` — new `handoff` status handling; ensure Playwright path still one-shot.
+  - Unit: JS template generation (snapshot.js injection, guard per action kind, settle-loop boundaries); group→server-name/profile mapping; trace `ego` block round-trip; `Input.insertText`→`keyboard.insertText` substitution.
+  - Live (`@pytest.mark.ego`, skip unless `FBU_EGO_LIVE=1` and app running + Full Access): real `ego-browser nodejs` round-trip — observe→act→re-observe on `benchmarks/pages/settings.html` (re-verifies POC #4/#5), plus handoff→resume.
+- `test_cli.py` — `--browser`, `--group`, `--profile-dir`, `resume` parsing + preflight error paths (ego-not-macOS, live-profile rejection).
+- `test_agent.py` — `handoff` status handling; isolated path stays one-shot.
+- Shared-JS tests: `test_dom_expressions.py` — assert all three tiers interpolate the same expressions (no drift).
 
 ## 12. Non-Goals
 
-- Replacing Playwright as the default or only backend. (ego is opt-in.)
-- Reversing the latency cost (sub-second per step on ego) — accepted; not solvable without an undocumented direct-IPC path that would violate the zero-black-box principle.
-- Linux/Windows/headless support for the ego backend — ego lite is a macOS desktop app; the ego backend is macOS-only by construction. Playwright covers the other platforms.
-- Model-driven handoff — explicitly rejected (breaks zero-hallucination).
-- New profiles created programmatically — `FBU_EGO_PROFILE` references existing profile ids only; profile creation stays in the ego lite app UI.
+- ego as the Windows backend — no Windows build (waitlist). Deferred until ego lite ships Windows.
+- Sub-second per-step latency on ego — accepted (persistent IPC blocked, POC #3).
+- Reverse-engineering ego lite's named-service socket — no black-box IPC.
+- Model-driven handoff — rejected (breaks zero-hallucination).
+- Programmatic ego profile creation — `FBU_EGO_PROFILE` references existing ids only.
+- Pointing `user_data_dir` at a live Chrome profile — rejected (lock + safety).
+- OpenWiki page edits — regenerated by the scheduled workflow.
 
 ## 13. Compatibility & Migration
 
 - Default `FBU_BROWSER=playwright`: zero change to existing runs, benchmarks, `fbu record`, SKILL, CI.
-- The `Browser` rename is the only refactor to existing code; `agent.py` is unchanged at the call sites (same method names, same page-dict contract).
-- OpenWiki / SKILL docs get a short "Optional ego backend" section noting the macOS-only, login-state-reuse, resumable-session, and ~2–3 s/step caveats.
-- No dependency additions for the default path; the ego path requires only `ego-browser` on PATH (external CLI), keeping `pyproject.toml` unchanged.
+- The `Browser` rename + `dom_expressions.py` extraction is the only refactor to existing code; `agent.py` is unchanged at call sites.
+- `playwright-persistent` is purely additive (new class + factory branch).
+- `ego` is macOS-only and opt-in; the preflight rejects it elsewhere.
+- SKILL/OpenWiki get a short "Browser tiers" section: default isolated; `playwright-persistent` for auth (cross-platform); `ego` macOS-only advanced.
+- No dependency additions for the default/persistent paths; the ego path needs only the external `ego-browser` CLI. `pyproject.toml` unchanged.
