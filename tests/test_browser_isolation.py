@@ -27,3 +27,21 @@ def test_isolated_storage_state_per_group_roundtrip(tmp_path):
 def test_default_storage_path_per_group():
     assert default_storage_path("team-x") == os.path.expanduser("~/.fbu/storage/team-x.json")
     assert default_storage_path("a-b_C.0") == os.path.expanduser("~/.fbu/storage/a-b_C.0.json")
+
+
+@pytest.mark.persistent
+def test_isolated_pause_handoff_returns_on_sentinel(tmp_path):
+    pytest.importorskip("playwright")
+    sentinel = tmp_path / "go"
+    sentinel.touch()  # human "signals" before handoff polls -> returns immediately
+    b = PlaywrightBrowser("https://example.com", handoff_mode="pause", sentinel=str(sentinel))
+    assert b.headless is False  # pause mode forces a visible window
+    rec = b.handoff("login required")
+    assert rec["mechanism"] == "pause"
+    assert rec["reason"] == "login required"
+    assert rec["url"].startswith("https://example.com")
+    assert b.context is not None  # pause did NOT close the context (in-process continue)
+    # takeover in pause mode is a no-op: same process, just re-observe.
+    page = b.takeover()
+    assert "url" in page and "actions" in page
+    b.close()

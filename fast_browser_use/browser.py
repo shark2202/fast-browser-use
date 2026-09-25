@@ -28,18 +28,23 @@ class StalePage(ValueError):
 class PlaywrightBrowser:
     def __init__(
         self, url, *, video_dir=None, viewport=None, headless=None,
-        profile_dir=None, handoff_mode="auto", group=None, storage_state_path=None,
+        profile_dir=None, handoff_mode="auto", group=None, storage_state_path=None, sentinel=None,
     ):
         self.driver = sync_playwright().start()
         self.chrome = None
         self.profile_dir = profile_dir
         self.handoff_mode = handoff_mode
         self.group = group
+        self.sentinel = sentinel
         self.storage_state_path = storage_state_path if not profile_dir else None
         if self.storage_state_path is None and group and not profile_dir:
             self.storage_state_path = default_storage_path(group)
         try:
             self.headless = os.environ.get("FBU_HEADLESS", "1") != "0" if headless is None else headless
+            # pause handoff shows the window to the human; force headed only when pause is explicit
+            # (not 'auto', which would otherwise force headed on every isolated browser by default).
+            if self.handoff_mode == "pause":
+                self.headless = False
             self.locale = os.environ.get("FBU_LOCALE", "en-US")
             options = {
                 "viewport": viewport or {"width": 1120, "height": 780},
@@ -77,6 +82,12 @@ class PlaywrightBrowser:
     def session_id(self):
         return self.profile_dir
 
+    def _effective_handoff_mode(self):
+        eff = self.handoff_mode
+        if eff == "auto":
+            eff = "resume" if self.profile_dir else "pause"
+        return eff
+
     def handoff(self, reason, *, mechanism="auto"):
         """Yield control. mechanism: auto (resume if profile_dir else pause) | resume | pause."""
         eff = mechanism if mechanism != "auto" else self.handoff_mode
@@ -89,13 +100,42 @@ class PlaywrightBrowser:
             self.close()  # close the context; the profile dir persists on disk for fbu resume
             return {"reason": reason, "url": url, "mechanism": "resume"}
         if eff == "pause":
-            raise NotImplementedError("pause handoff lands in P3")
+            url = self.evaluate("location.href")
+            timeout_s = int(os.environ.get("FBU_HANDOFF_TIMEOUT", "300"))
+            if not 0 <= timeout_s <= 86400:
+                raise ValueError("FBU_HANDOFF_TIMEOUT must be between 0 and 86400 seconds")
+            if self.sentinel:
+                hint = f"then touch: {self.sentinel}"
+            else:
+                hint = "then press Enter on stdin"
+            print(
+                f"[fbu] Handoff (reason: {reason}). Act in the browser window, {hint} "
+                f"(timeout {timeout_s}s).",
+                flush=True,
+            )
+            deadline = time.time() + timeout_s if timeout_s > 0 else None
+            self._wait_for_handoff_signal(deadline)
+            return {"reason": reason, "url": url, "mechanism": "pause"}
         raise ValueError(f"unknown handoff mechanism {eff!r}")
 
+    def _wait_for_handoff_signal(self, deadline):
+        """Block in-process until the human signals: sentinel file exists, stdin line, or timeout."""
+        if self.sentinel:
+            while not os.path.exists(self.sentinel):
+                if deadline and time.time() >= deadline:
+                    return
+                time.sleep(0.5)
+            return
+        # stdin path: block on one line. (Tests monkeypatch builtins.input.)
+        try:
+            input()
+        except EOFError:
+            return
+
     def takeover(self):
-        """Resume control. Persistent: __init__ already restored the profile; observe the current page."""
-        if not self.profile_dir:
-            raise ValueError("takeover requires persistent mode (profile_dir)")
+        """Resume control. Persistent: __init__ restored the profile. Pause: same process, just observe."""
+        if not self.profile_dir and self._effective_handoff_mode() != "pause":
+            raise ValueError("takeover requires persistent mode (profile_dir) or pause mode")
         return self.observe()
 
     def call(self, method, **params):
@@ -334,7 +374,10 @@ def make_browser(url, *, browser=None, **opts) -> Browser:
 
 
 def _pw_opts(opts):
-    allowed = {"video_dir", "viewport", "headless", "profile_dir", "handoff_mode", "group", "storage_state_path"}
+    allowed = {
+        "video_dir", "viewport", "headless", "profile_dir", "handoff_mode",
+        "group", "storage_state_path", "sentinel",
+    }
     return {k: v for k, v in opts.items() if k in allowed}
 
 
