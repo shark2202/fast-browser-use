@@ -1,6 +1,6 @@
 # Zig + llama.cpp + System One 重构设计
 
-> 状态：架构方向已确认，进入详细设计阶段  
+> 状态：产品要求已锁定，技术实现通过分批 POC 锁定
 > 日期：2026-09-25  
 > 分支：`go_v1`
 
@@ -261,6 +261,114 @@ scripts/
 README
 ```
 
+### 5.1 自动初始化
+
+用户解压平台压缩包后，不要求预先安装 Python、Node.js、Playwright、Chromium 或模型下载工具。
+
+统一入口：
+
+```bash
+fbu setup
+```
+
+`fbu setup` 必须完成：
+
+1. 检测操作系统、CPU 架构和运行权限。
+2. 下载匹配版本的 Node.js runtime。
+3. 安装并配置 browser-worker 的 Node 依赖。
+4. 安装固定版本 Playwright。
+5. 下载匹配版本 Chromium。
+6. 配置 Playwright/Chromium 缓存目录。
+7. 从 ModelScope 下载指定 GGUF 模型。
+8. 校验下载文件的 SHA256。
+9. 写入 runtime manifest 和安装状态。
+10. 注册 `fast-browser-use` skill。
+11. 执行浏览器和模型 smoke test。
+
+初始化必须满足：
+
+- 幂等：重复执行不会重复安装已经验证的组件。
+- 可恢复：中断下载后可以断点续传。
+- 原子安装：组件先写入临时目录，验证通过后再切换到正式目录。
+- 可诊断：每个组件记录版本、来源、revision、文件、SHA256 和安装状态。
+- 可离线复用：已安装组件可在 `HF_HUB_OFFLINE` 等环境之外独立运行，不再依赖 Python 包管理器。
+
+推荐目录：
+
+```text
+~/.fbu/
+├── runtime/
+│   ├── node/
+│   ├── playwright/
+│   └── chromium/
+├── models/
+│   └── qwen/
+├── cache/
+├── profiles/
+├── storage/
+└── manifests/
+    └── installed.json
+```
+
+### 5.2 ModelScope 原生下载
+
+模型下载由 Zig 原生实现，不调用 Python `modelscope` SDK。
+
+下载器必须支持：
+
+- ModelScope model/revision 定位
+- 文件清单获取
+- GGUF 文件筛选
+- 大文件分片下载
+- HTTP Range 断点续传
+- 下载缓存
+- SHA256 校验
+- 临时文件清理
+- 失败重试
+- 代理和自定义 endpoint
+
+默认模型配置通过 manifest 管理：
+
+```json
+{
+  "provider": "modelscope",
+  "model": "Qwen/Qwen3.5-9B-GGUF",
+  "revision": "locked-revision",
+  "files": ["*.gguf"],
+  "sha256": {}
+}
+```
+
+### 5.3 Node、Playwright 与 Chromium
+
+发布包包含 browser-worker 源码和锁定的依赖 manifest，但不强制把所有平台的 Node/Chromium 二进制塞进同一个压缩包。
+
+`fbu setup` 根据目标平台下载：
+
+```text
+Node.js runtime
+Playwright package
+Chromium browser revision
+```
+
+版本必须写入同一个 runtime manifest，避免 Node、Playwright 和 Chromium 版本漂移。
+
+### 5.4 Linux 系统依赖策略
+
+采用显式双模式：
+
+```bash
+fbu setup
+fbu setup --with-system-deps
+fbu setup --no-system-deps
+```
+
+- 默认 `fbu setup`：不擅自调用 sudo；检测缺少的系统库并输出可执行修复建议。
+- `--with-system-deps`：明确允许调用系统包管理器并请求 sudo，自动安装 Chromium 所需依赖。
+- `--no-system-deps`：禁止系统修改；缺依赖时失败并输出诊断信息。
+
+系统包管理器适配按目标发行版拆分，不把 `apt` 假设为所有 Linux 的唯一实现。
+
 ## 6. 兼容策略
 
 V1 尽量保留当前用户可见能力：
@@ -310,7 +418,126 @@ fbu build-targets
 - snapshot/guard 语义迁移
 - 移除 Node.js/Playwright Worker
 
-## 8. 当前未决设计项
+## 8. POC 锁定矩阵
+
+实现前按以下顺序验证，每个 POC 必须产出结论、证据和下一步决策。
+
+### POC-1：Zig 交叉编译与压缩包
+
+验证目标：
+
+- 一台宿主机生成五个目标包。
+- 每个包的 `fbu --version` 可以启动。
+- `fbu doctor` 能识别目标平台、架构和安装目录。
+- CLI、skill、manifest、worker 文件路径在所有平台一致。
+
+锁定结果：
+
+- target triple
+- release 命名
+- zip 目录结构
+- 安装入口
+
+### POC-2：llama.cpp GGUF 推理
+
+验证目标：
+
+- Zig 加载 GGUF。
+- 能执行 tokenizer 和单 Token logits。
+- 候选动作概率与参考实现一致。
+- 文本生成能够返回严格 JSON。
+- CPU 运行时不依赖 Python。
+
+锁定结果：
+
+- llama.cpp 集成方式
+- GGUF metadata 要求
+- context/KV cache 生命周期
+- 默认 CPU 运行策略
+
+### POC-3：ModelScope 原生下载
+
+验证目标：
+
+- 不安装 Python 也能下载 GGUF。
+- 支持 revision、文件筛选、断点续传和 SHA256。
+- 网络中断后能恢复。
+- 下载完成后能被 llama.cpp 直接加载。
+
+锁定结果：
+
+- ModelScope endpoint 和请求协议
+- manifest 格式
+- 缓存目录
+- 重试和校验策略
+
+### POC-4：Node/Playwright/Chromium 自动配置
+
+验证目标：
+
+- `fbu setup` 自动准备 Node runtime。
+- Worker 可以加载 Playwright。
+- Chromium 能在三大平台启动。
+- observe、click、fill、select、scroll 全部可用。
+
+锁定结果：
+
+- Node runtime 来源和版本
+- Playwright 版本
+- Chromium revision
+- Worker 启动协议
+
+### POC-5：Linux 系统依赖
+
+验证目标：
+
+- `fbu setup` 默认不修改系统。
+- `fbu setup --with-system-deps` 可以完成自动安装。
+- 缺少 sudo 时给出可操作错误。
+- `--no-system-deps` 行为稳定可预测。
+
+锁定结果：
+
+- 发行版检测
+- apt/dnf/pacman 适配边界
+- 权限请求策略
+- 失败回滚行为
+
+### POC-6：System One API
+
+验证目标：
+
+- `/v1/systemone` 支持 `noul`、`choice`、`score`。
+- `/v1/browser/*` 与同一决策核心复用。
+- API 可被外部 Agent 调用。
+- 概率、confidence、usage、错误结构稳定。
+
+锁定结果：
+
+- wire schema
+- HTTP 服务启动方式
+- 会话和并发模型
+- API 兼容范围
+
+### POC-7：端到端与发布包
+
+验证目标：
+
+- 从全新机器解压压缩包。
+- 执行 `fbu setup`。
+- 下载模型和浏览器依赖。
+- 执行浏览器任务。
+- 安装 skill。
+- 生成 trace 并完成独立验证。
+
+锁定结果：
+
+- 正式安装流程
+- smoke test
+- release checklist
+- 升级和卸载行为
+
+## 9. 当前未决设计项
 
 以下内容在详细设计阶段继续确认：
 
@@ -322,7 +549,7 @@ fbu build-targets
 6. 是否在 V1 同时提供 C ABI。
 7. System One API 的鉴权、并发和会话生命周期。
 
-## 9. 非目标
+## 10. 非目标
 
 V1 不做：
 
@@ -331,4 +558,3 @@ V1 不做：
 - 默认内置数 GB 模型文件
 - 修改 System One 的核心决策语义以适配某个特定网站
 - 重新引入 Python 作为运行时依赖
-
