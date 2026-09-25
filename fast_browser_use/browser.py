@@ -26,11 +26,18 @@ class StalePage(ValueError):
 
 
 class PlaywrightBrowser:
-    def __init__(self, url, *, video_dir=None, viewport=None, headless=None, profile_dir=None, handoff_mode="auto"):
+    def __init__(
+        self, url, *, video_dir=None, viewport=None, headless=None,
+        profile_dir=None, handoff_mode="auto", group=None, storage_state_path=None,
+    ):
         self.driver = sync_playwright().start()
         self.chrome = None
         self.profile_dir = profile_dir
         self.handoff_mode = handoff_mode
+        self.group = group
+        self.storage_state_path = storage_state_path if not profile_dir else None
+        if self.storage_state_path is None and group and not profile_dir:
+            self.storage_state_path = default_storage_path(group)
         try:
             self.headless = os.environ.get("FBU_HEADLESS", "1") != "0" if headless is None else headless
             self.locale = os.environ.get("FBU_LOCALE", "en-US")
@@ -51,6 +58,8 @@ class PlaywrightBrowser:
                 self.target = "persistent-chromium"
             else:
                 self.chrome = self.driver.chromium.launch(headless=self.headless)
+                if self.storage_state_path and os.path.exists(self.storage_state_path):
+                    options["storage_state"] = self.storage_state_path
                 self.context = self.chrome.new_context(**options)
                 self.page = self.context.new_page()
                 self.target = "isolated-chromium"
@@ -217,7 +226,10 @@ class PlaywrightBrowser:
                     # persistent: chrome is the context; closing finalizes the profile and video.
                     self.chrome.close()
                 else:
-                    # isolated: chrome is a Browser; close the context first (finalizes video), then the browser.
+                    # isolated: save per-group storage_state before closing the context (if a path is set).
+                    if self.storage_state_path and getattr(self, "context", None):
+                        os.makedirs(os.path.dirname(self.storage_state_path) or ".", exist_ok=True)
+                        self.context.storage_state(path=self.storage_state_path)
                     if getattr(self, "context", None):
                         self.context.close()
                 if video_path and getattr(self, "video", None):
@@ -322,8 +334,13 @@ def make_browser(url, *, browser=None, **opts) -> Browser:
 
 
 def _pw_opts(opts):
-    allowed = {"video_dir", "viewport", "headless", "profile_dir", "handoff_mode"}
+    allowed = {"video_dir", "viewport", "headless", "profile_dir", "handoff_mode", "group", "storage_state_path"}
     return {k: v for k, v in opts.items() if k in allowed}
+
+
+def default_storage_path(group):
+    """Per-group storage_state file for isolated mode: ~/.fbu/storage/<group>.json."""
+    return os.path.expanduser(f"~/.fbu/storage/{group}.json")
 
 
 def _ego_opts(opts):
