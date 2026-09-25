@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import time
+from typing import Protocol
 
 from playwright.sync_api import sync_playwright
 
@@ -24,7 +25,7 @@ class StalePage(ValueError):
     """A decision no longer refers to the observed page."""
 
 
-class Browser:
+class PlaywrightBrowser:
     def __init__(self, url, *, video_dir=None, viewport=None, headless=None):
         self.driver = sync_playwright().start()
         self.chrome = None
@@ -250,3 +251,37 @@ def browser_operation(request):
     if request.get("screenshot", True):
         info["screenshot"] = call("Page.captureScreenshot", format="jpeg", quality=72)["data"]
     return info
+
+
+class Browser(Protocol):
+    """Backend contract. PlaywrightBrowser (isolated/persistent) and EgoBrowser implement this.
+
+    handoff/takeover/session_id are added in P2/P3 as collaboration lands.
+    """
+
+    def observe(self, screenshot: bool = True) -> dict: ...
+    def fresh(self, page: dict, action: dict | None = None) -> bool: ...
+    def prepare(self, page: dict, *, screenshot: bool = False) -> dict: ...
+    def act(self, action: dict, page: dict, text: str | None = None) -> dict: ...
+    def close(self, *, video_path: str | None = None) -> None: ...
+
+
+def make_browser(url, *, browser=None, **opts) -> Browser:
+    """Select and construct a backend. FBU_BROWSER env (default 'playwright')."""
+    browser = browser or os.environ.get("FBU_BROWSER", "playwright")
+    if browser == "playwright":
+        return PlaywrightBrowser(url, **_pw_opts(opts))
+    if browser == "ego":
+        from .ego_browser import EgoBrowser
+        return EgoBrowser(url, **_ego_opts(opts))
+    raise ValueError(f"FBU_BROWSER must be playwright or ego, got {browser!r}")
+
+
+def _pw_opts(opts):
+    allowed = {"video_dir", "viewport", "headless"}
+    return {k: v for k, v in opts.items() if k in allowed}
+
+
+def _ego_opts(opts):
+    allowed = {"group", "profile_id", "space_id", "handoff_mode"}
+    return {k: v for k, v in opts.items() if k in allowed}

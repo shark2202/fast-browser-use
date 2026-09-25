@@ -132,13 +132,27 @@ def test_observation_is_one_atomic_browser_read(monkeypatch):
 def test_executor_rejects_a_stale_page_before_browser_input(monkeypatch):
     import fast_browser_use.browser as browser
 
-    b = browser.Browser.__new__(browser.Browser)
+    b = browser.PlaywrightBrowser.__new__(browser.PlaywrightBrowser)
     b.fresh = Mock(return_value=False)
     operation = Mock()
     monkeypatch.setattr(browser, "browser_operation", operation)
     with pytest.raises(StalePage):
         b.act(page()["actions"][0], page(), "book")
     operation.assert_not_called()
+
+
+def test_agent_uses_factory(monkeypatch):
+    called = {}
+
+    def fake_make_browser(url, **opts):
+        called["url"] = url
+        called["opts"] = opts
+        raise RuntimeError("stop-after-factory")
+
+    monkeypatch.setattr(loop, "make_browser", fake_make_browser)
+    with pytest.raises(RuntimeError, match="stop-after-factory"):
+        loop.Agent("https://example.com", "goal")
+    assert called["url"] == "https://example.com"
 
 
 @pytest.mark.parametrize("response", [{"exceptionDetails": {}}, {"result": {}}])

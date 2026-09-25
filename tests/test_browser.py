@@ -9,7 +9,7 @@ from fast_browser_use import browser
 
 
 def test_empty_document_and_redirect_are_observed_again_without_input(monkeypatch):
-    instance = browser.Browser.__new__(browser.Browser)
+    instance = browser.PlaywrightBrowser.__new__(browser.PlaywrightBrowser)
     instance.session = Mock()
     empty = {"text": "", "actions": [{"kind": "wait"}]}
     ready = {"text": "Search", "actions": [{"kind": "fill", "node": 1}]}
@@ -23,7 +23,7 @@ def test_empty_document_and_redirect_are_observed_again_without_input(monkeypatc
 
 
 def test_preparation_defers_inference_when_every_read_is_interrupted(monkeypatch):
-    instance = browser.Browser.__new__(browser.Browser)
+    instance = browser.PlaywrightBrowser.__new__(browser.PlaywrightBrowser)
     instance.session = Mock()
     operation = Mock(side_effect=browser.StalePage("navigation"))
     monkeypatch.setattr(browser, "browser_operation", operation)
@@ -36,3 +36,13 @@ def test_preparation_defers_inference_when_every_read_is_interrupted(monkeypatch
     assert operation.call_count > 0
     assert all(call.args[0]["operation"] == "observe" for call in operation.call_args_list)
     instance.session.send.assert_not_called()
+
+
+def test_make_browser_factory_and_playwright_class_present():
+    assert callable(browser.make_browser)
+    assert hasattr(browser, "PlaywrightBrowser")
+
+
+def test_make_browser_unknown_backend_raises():
+    with pytest.raises(ValueError, match="FBU_BROWSER"):
+        browser.make_browser("https://example.com", browser="bogus")

@@ -5,7 +5,7 @@ import os
 import time
 from pathlib import Path
 
-from .browser import Browser, StalePage
+from .browser import StalePage, make_browser
 from .model import action_space, choose, field_context, field_text, make_plan
 from .questions import MAX_STEPS
 
@@ -17,7 +17,7 @@ class Agent:
             raise ValueError("Supply a task")
         plan = [task]
         self.pending_text = None
-        self.browser = Browser(url, video_dir=video_dir, viewport=viewport, headless=headless)
+        self.browser = make_browser(url, video_dir=video_dir, viewport=viewport, headless=headless)
         self.record_dir = Path(record_dir) if record_dir else None
         self.screenshots = screenshots or bool(record_dir)
         try:
