@@ -390,6 +390,26 @@ export HF_HUB_OFFLINE=1
 
 ---
 
+## 🌐 Browser Backends & Modes
+
+`fbu` selects a browser driver with `--browser` (or `FBU_BROWSER`); `--profile-dir` selects Playwright's persistent mode; `--group` adds per-group isolation; `--handoff` / `--handoff-mode` control human–AI collaboration. All optional — the default is an isolated, headless Playwright Chromium (unchanged for benchmarks and CI).
+
+| Backend / mode | Platforms | Login reuse | Isolation | Human–AI collaboration |
+| --- | --- | --- | --- | --- |
+| `playwright` (default, isolated) | Linux / Windows / macOS | ❌ empty profile | ephemeral | one-shot |
+| `playwright --profile-dir <dir>` (persistent) | Linux / Windows / macOS | ✅ real on-disk profile (point at a **copy** of the user's Chrome/Edge profile, never the live one) | one profile dir per `--group` | in-process pause + cross-process `fbu resume` |
+| `ego` (advanced) | **macOS only** | ✅ ego lite real sessions | `--ego-server-name` (needs Full Access) | native `handOff` / `takeOverTaskSpace` |
+
+**Persistent login reuse (cross-platform):**
+```bash
+fbu run 'https://target.example/' --goal '...' \
+  --browser playwright --profile-dir ~/.fbu/profiles/personal --group personal
+```
+
+**Human–AI handoff** — `--handoff auto` (default) triggers a handoff when the harness detects a login wall, captcha, 2FA, or an IdP redirect (the model never selects handoff — zero-hallucination). `--handoff-mode pause` shows a headed window and blocks in-process until the human signals (`FBU_HANDOFF_TIMEOUT`, default 300s); `--handoff-mode resume` exits, retaining the profile / ego space for `fbu resume`. `resume` requires a persistent profile dir or the ego backend; isolated + resume raises a clear error.
+
+> **ego backend (macOS only):** requires the `ego lite` app running and the `ego-browser` CLI on PATH; `--ego-server-name` group isolation needs Full Access (fails in sandboxed agent hosts). Expect ~2–3 s per step (ego cannot host persistent IPC; per-CLI-invocation startup is unavoidable). See `docs/ego-backend-design.md`.
+
 ## 🐍 Python API
 
 Integrate Fast Browser Use directly into your Python automation workflows:

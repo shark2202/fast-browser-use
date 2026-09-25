@@ -383,6 +383,26 @@ export HF_HUB_OFFLINE=1
 
 ---
 
+## 🌐 浏览器后端与模式
+
+`fbu` 通过 `--browser`（或 `FBU_BROWSER`）选择浏览器驱动；`--profile-dir` 选择 Playwright 持久模式；`--group` 启用按组隔离；`--handoff` / `--handoff-mode` 控制人机协作。均为可选——默认为隔离的无头 Playwright Chromium（基准与 CI 不变）。
+
+| 后端 / 模式 | 平台 | 登录态复用 | 隔离 | 人机协作 |
+| --- | --- | --- | --- | --- |
+| `playwright`（默认，隔离） | Linux / Windows / macOS | ❌ 空 profile | 临时 | 一次性 |
+| `playwright --profile-dir <dir>`（持久） | Linux / Windows / macOS | ✅ 真实磁盘 profile（指向用户 Chrome/Edge profile 的**副本**，切勿指向正在使用的实时 profile） | 每个 `--group` 一个 profile 目录 | 同进程 pause + 跨进程 `fbu resume` |
+| `ego`（高级） | **仅 macOS** | ✅ ego lite 真实会话 | `--ego-server-name`（需 Full Access） | 原生 `handOff` / `takeOverTaskSpace` |
+
+**跨平台登录态复用（持久模式）：**
+```bash
+fbu run 'https://target.example/' --goal '...' \
+  --browser playwright --profile-dir ~/.fbu/profiles/personal --group personal
+```
+
+**人机协作 handoff**——`--handoff auto`（默认）在 harness 检测到登录墙、验证码、二次验证或 IdP 重定向时触发 handoff（模型从不参与选择——零幻觉）。`--handoff-mode pause` 弹出可见窗口并同进程阻塞，直到人工信号（`FBU_HANDOFF_TIMEOUT`，默认 300s）；`--handoff-mode resume` 退出并保留 profile / ego 空间供 `fbu resume`。`resume` 需要持久 profile 目录或 ego 后端；隔离模式 + resume 会报明确错误。
+
+> **ego 后端（仅 macOS）：** 需运行 `ego lite` 应用且 `ego-browser` CLI 在 PATH；`--ego-server-name` 分组隔离需 Full Access（在沙箱化 agent 内不可用）。每步约 ~2–3s（ego 无法托管持久 IPC，每次 CLI 调用启动不可避免）。详见 `docs/ego-backend-design.md`。
+
 ## 🐍 Python SDK
 
 在 Python 代码中以编程方式调用 Fast Browser Use：
