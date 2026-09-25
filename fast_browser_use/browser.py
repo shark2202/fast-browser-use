@@ -26,10 +26,11 @@ class StalePage(ValueError):
 
 
 class PlaywrightBrowser:
-    def __init__(self, url, *, video_dir=None, viewport=None, headless=None, profile_dir=None):
+    def __init__(self, url, *, video_dir=None, viewport=None, headless=None, profile_dir=None, handoff_mode="auto"):
         self.driver = sync_playwright().start()
         self.chrome = None
         self.profile_dir = profile_dir
+        self.handoff_mode = handoff_mode
         try:
             self.headless = os.environ.get("FBU_HEADLESS", "1") != "0" if headless is None else headless
             self.locale = os.environ.get("FBU_LOCALE", "en-US")
@@ -66,6 +67,27 @@ class PlaywrightBrowser:
     @property
     def session_id(self):
         return self.profile_dir
+
+    def handoff(self, reason, *, mechanism="auto"):
+        """Yield control. mechanism: auto (resume if profile_dir else pause) | resume | pause."""
+        eff = mechanism if mechanism != "auto" else self.handoff_mode
+        if eff == "auto":
+            eff = "resume" if self.profile_dir else "pause"
+        if eff == "resume":
+            if not self.profile_dir:
+                raise ValueError("isolated context cannot survive process exit; use pause or --profile-dir")
+            url = self.evaluate("location.href")
+            self.close()  # close the context; the profile dir persists on disk for fbu resume
+            return {"reason": reason, "url": url, "mechanism": "resume"}
+        if eff == "pause":
+            raise NotImplementedError("pause handoff lands in P3")
+        raise ValueError(f"unknown handoff mechanism {eff!r}")
+
+    def takeover(self):
+        """Resume control. Persistent: __init__ already restored the profile; observe the current page."""
+        if not self.profile_dir:
+            raise ValueError("takeover requires persistent mode (profile_dir)")
+        return self.observe()
 
     def call(self, method, **params):
         return self.session.send(method, params)
@@ -300,7 +322,7 @@ def make_browser(url, *, browser=None, **opts) -> Browser:
 
 
 def _pw_opts(opts):
-    allowed = {"video_dir", "viewport", "headless", "profile_dir"}
+    allowed = {"video_dir", "viewport", "headless", "profile_dir", "handoff_mode"}
     return {k: v for k, v in opts.items() if k in allowed}
 
 
