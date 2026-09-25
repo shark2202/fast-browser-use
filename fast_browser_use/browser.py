@@ -7,7 +7,17 @@ import time
 
 from playwright.sync_api import sync_playwright
 
-from .dom_expressions import MARKER, READ_STATE, fingerprint, select_runtime_error
+from .dom_expressions import (
+    MARKER,
+    READ_STATE,
+    act_dispatch_guard,
+    after_input_wait,
+    click_fresh_guard,
+    fingerprint,
+    scroll_fresh_guard,
+    scroll_point,
+    select_runtime_error,
+)
 
 
 class StalePage(ValueError):
@@ -61,29 +71,7 @@ class Browser:
             try:
                 self.call(
                     "Runtime.evaluate",
-                    expression="""(action => new Promise(resolve => {
-                      const field=window.__fastBrowserUse?.nodes.get(action.node);
-                      const autocomplete=action.kind==='fill' && field?.getAttribute('role')==='combobox';
-                      let frames=0, stopped=false;
-                      const finish=()=>{stopped=true;resolve()};
-                      setTimeout(finish,autocomplete ? 200 : 50);
-                      const ready=()=>{
-                        if (stopped) return;
-                        const ids=(field?.getAttribute('aria-controls')||field?.getAttribute('aria-owns')||'')
-                          .split(/\\s+/).filter(Boolean);
-                        const roots=ids.length ? ids.map(id=>document.getElementById(id)).filter(Boolean) : [document];
-                        const options=roots.flatMap(root=>[...root.querySelectorAll('[role="option"]')]);
-                        if (++frames>=2 && (!autocomplete || options.some(e=>{
-                          const r=e.getBoundingClientRect();
-                          return r.width && r.height && r.bottom>0 && r.top<innerHeight &&
-                            e.checkVisibility({checkOpacity:true,checkVisibilityCSS:true});
-                        }))) finish();
-                        else requestAnimationFrame(ready);
-                      };
-                      requestAnimationFrame(ready);
-                    }))("""
-                    + json.dumps(action)
-                    + ")",
+                    expression=after_input_wait(json.dumps(action)),
                     awaitPromise=True,
                     returnByValue=True,
                 )
@@ -108,19 +96,13 @@ class Browser:
             node = action["node"]
             if type(node) is not int:
                 return False
-            current = self.evaluate(
-                "(() => { const c=window.__fastBrowserUse; "
-                f"return c ? [c.pageKey(),c.scrollGuard(c.nodes.get({node}))] : null; }})()"
-            )
+            current = self.evaluate(scroll_fresh_guard(node))
             return current == [page["page_key"], action["scroll_state"]]
         if action is not None and action["kind"] in {"click", "select", "fill"}:
             node = action["node"]
             if type(node) is not int:
                 return False
-            current = self.evaluate(
-                "(() => { const c=window.__fastBrowserUse; "
-                f"return c ? [c.pageKey(),c.guard(c.nodes.get({node}))] : null; }})()"
-            )
+            current = self.evaluate(click_fresh_guard(node))
             return current == [page["page_key"], page["guards"].get(str(node))]
         return self.evaluate(MARKER) == page["marker"]
 
@@ -225,10 +207,7 @@ def browser_operation(request):
             node = action.get("node")
             if node is not None and type(node) is not int:
                 raise ValueError("Invalid observed scroll region")
-            target = evaluate(
-                "(() => { const c=window.__fastBrowserUse; return c?.scrollPoint("
-                + (f"c.nodes.get({node})" if node is not None else "document.scrollingElement") + "); })()"
-            )
+            target = evaluate(scroll_point(node))
             if target is None:
                 raise StalePage("Scroll region is covered or no longer available")
             call("Input.dispatchMouseEvent", type="mouseWheel", **target, deltaX=0, deltaY=action["delta"])
@@ -236,29 +215,7 @@ def browser_operation(request):
             if type(action["node"]) is not int:
                 raise ValueError("Invalid observed node")
             # Code-owned node IDs refer to actual observed elements, never model-generated selectors.
-            target = evaluate(
-                """(action => {
-              const e=window.__fastBrowserUse?.nodes.get(action.node);
-              if (!e?.isConnected || e.matches(':disabled') || e.closest('[aria-disabled="true"],[inert]') ||
-                  !e.checkVisibility({checkOpacity:true,checkVisibilityCSS:true})) return null;
-              if (e.tagName==='LABEL' && (!e.control || e.control.matches(':disabled') ||
-                  e.control.closest('[aria-disabled="true"]'))) return null;
-              if (action.kind==='fill' && (e.readOnly || e.getAttribute('aria-readonly')==='true')) return null;
-              const r=e.getBoundingClientRect(), x=r.x+r.width/2, y=r.y+r.height/2;
-              if (!r.width || !r.height || x<0 || y<0 || x>=innerWidth || y>=innerHeight) return null;
-              if (!e.contains(document.elementFromPoint(x,y))) return null;
-              if (action.kind==='select') {
-                if (e.tagName!=='SELECT' || ![...e.options].some(o=>o.value===action.value &&
-                    !o.disabled && !o.closest('optgroup[disabled]'))) return null;
-                e.value=action.value;
-                e.dispatchEvent(new Event('input',{bubbles:true}));
-                e.dispatchEvent(new Event('change',{bubbles:true}));
-              }
-              return {x,y};
-            })("""
-                + json.dumps(action)
-                + ")"
-            )
+            target = evaluate(act_dispatch_guard(json.dumps(action)))
             if target is None:
                 if kind == "select":
                     raise select_runtime_error("not_confirmed")
