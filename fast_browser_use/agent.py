@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 
 from .browser import StalePage, make_browser
+from .handoff import detect_handoff
 from .model import action_space, choose, field_context, field_text, make_plan
 from .questions import MAX_STEPS
 
@@ -43,6 +44,7 @@ class Agent:
             verification_rejections=[],
             observations=[],
             text_calls=[],
+            handoffs=[],
             elapsed_ms=0,
             started_at=None,
             record=bool(self.record_dir),
@@ -55,7 +57,34 @@ class Agent:
         return {
             **{k: v for k, v in self.state.items() if k != "browser"},
             "elements": action_space(self.state["page"]["actions"])[0],
+            "session": {"session_id": getattr(self.state["browser"], "session_id", None)},
         }
+
+    def _maybe_handoff(self, state):
+        """Harness-triggered handoff (zero-hallucination: the model never selects it).
+
+        Returns a snapshot to end the tick (resume handoff) or None to continue
+        (no trigger, or a pause handoff that already resumed in-process).
+        """
+        mode = os.environ.get("FBU_HANDOFF", "auto")
+        if mode == "never":
+            return None
+        reason = "forced" if mode == "always" else detect_handoff(state["page"], state["history"])
+        if not reason:
+            return None
+        mechanism = os.environ.get("FBU_HANDOFF_MODE", "auto")
+        rec = state["browser"].handoff(reason, mechanism=mechanism)
+        state.setdefault("handoffs", []).append({
+            **rec,
+            "elapsed_ms": round((time.perf_counter() - state["started_at"]) * 1000),
+        })
+        if rec.get("mechanism") == "pause":
+            # in-process pause: the human acted in the visible window; re-observe and continue.
+            state["page"] = state["browser"].observe(screenshot=self.screenshots)
+            return None
+        state["status"] = "handoff"
+        state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
+        return self.snapshot()
 
     def command(self, name, body=None):
         body = body or {}
@@ -94,6 +123,9 @@ class Agent:
                         **state["page"]["preparation"],
                         "elapsed_ms": round((time.perf_counter() - state["started_at"]) * 1000),
                     })
+            handoff = self._maybe_handoff(state)
+            if handoff is not None:
+                return handoff
             state["decision"] = None
             if state["status"] in {"done", "blocked"}:
                 raise ValueError("This run has stopped. Start a fresh demo.")
@@ -200,7 +232,7 @@ class Agent:
         return self.snapshot()
 
     def run(self):
-        while self.state["status"] not in {"done", "blocked"}:
+        while self.state["status"] not in {"done", "blocked", "handoff"}:
             yield self.command("tick")
 
     def resume(self, reason):

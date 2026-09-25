@@ -155,6 +155,46 @@ def test_agent_uses_factory(monkeypatch):
     assert called["url"] == "https://example.com"
 
 
+def test_predict_handoff_resume_sets_status_and_records(monkeypatch):
+    a = loop.Agent.__new__(loop.Agent)
+    a.screenshots = False
+    a.pending_text = None
+    login_page = {
+        "url": "https://app.example.com/login",
+        "title": "Sign in",
+        "text": "Sign in to your account",
+        "scroll": {"y": 0},
+        "actions": [
+            {"id": "e1", "kind": "fill", "label": "Password", "role": "textbox", "value": "", "node": 1},
+            {"id": "e2", "kind": "click", "label": "Sign in", "role": "button", "value": "", "node": 2},
+        ],
+    }
+    login_page["fingerprint"] = fingerprint(login_page)
+    browser = Mock()
+    browser.fresh.return_value = True
+    browser.prepare.return_value = login_page
+    browser.observe.return_value = login_page
+    browser.session_id = None
+    browser.handoff.return_value = {
+        "reason": "login-required", "url": "https://app.example.com/login", "mechanism": "resume",
+    }
+    a.state = {
+        "browser": browser, "page": login_page, "decision": None, "goal": "g", "plan": ["g"],
+        "plan_index": 0, "planned": True, "plan_calls": [], "milestones": [], "history": [],
+        "decisions": [], "rejections": [], "verification_rejections": [], "observations": [],
+        "status": "ready", "started_at": time.perf_counter(), "record": False, "text_calls": [],
+        "handoffs": [], "step_history_index": 0, "elapsed_ms": 0,
+    }
+    monkeypatch.setenv("FBU_HANDOFF", "auto")
+    monkeypatch.delenv("FBU_HANDOFF_MODE", raising=False)
+    result = a.command("predict")
+    assert a.state["status"] == "handoff"
+    assert a.state["handoffs"][0]["reason"] == "login-required"
+    assert a.state["handoffs"][0]["mechanism"] == "resume"
+    browser.handoff.assert_called_once()
+    assert result["session"]["session_id"] is None  # isolated browser
+
+
 @pytest.mark.parametrize("response", [{"exceptionDetails": {}}, {"result": {}}])
 def test_interrupted_dropdown_mutation_cannot_be_retried_as_stale(monkeypatch, response):
     # A navigation can destroy the evaluation result after the change event already fired.
