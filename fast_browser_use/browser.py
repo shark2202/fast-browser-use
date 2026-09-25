@@ -1,17 +1,13 @@
 """Isolated Chromium with guarded DOM actions, adapted from Jev Ultrafast."""
 
-import hashlib
 import json
 import os
 import sys
 import time
-from pathlib import Path
 
 from playwright.sync_api import sync_playwright
 
-# Atomically read visible content and controls, preserving actual DOM node identity.
-READ_STATE = Path(__file__).with_name("snapshot.js").read_text()
-MARKER = f"(() => {{ const state={READ_STATE}; return state?.marker ?? null; }})()"
+from .dom_expressions import MARKER, READ_STATE, fingerprint, select_runtime_error
 
 
 class StalePage(ValueError):
@@ -207,11 +203,6 @@ class Browser:
             self.driver.stop()
 
 
-def fingerprint(state):
-    content = {k: state[k] for k in ("url", "text", "actions", "scroll")}
-    return hashlib.sha256(json.dumps(content, sort_keys=True).encode()).hexdigest()
-
-
 def browser_operation(request):
     operation = request["operation"]
     session = request["session"]
@@ -223,7 +214,7 @@ def browser_operation(request):
         result = call("Runtime.evaluate", expression=expression, returnByValue=True)
         if result.get("exceptionDetails"):
             if operation == "act" and request["action"]["kind"] == "select":
-                raise RuntimeError("Dropdown execution was interrupted; inspect before retrying.")
+                raise select_runtime_error("interrupted")
             raise StalePage("Document changed during evaluation")
         return result.get("result", {}).get("value")
 
@@ -270,7 +261,7 @@ def browser_operation(request):
             )
             if target is None:
                 if kind == "select":
-                    raise RuntimeError("Dropdown execution was not confirmed; inspect before retrying.")
+                    raise select_runtime_error("not_confirmed")
                 raise StalePage("Target changed or is covered. Observe again.")
             if kind != "select":
                 x, y = target["x"], target["y"]
