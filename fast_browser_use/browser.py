@@ -366,11 +366,29 @@ def make_browser(url, *, browser=None, **opts) -> Browser:
     """Select and construct a backend. FBU_BROWSER env (default 'playwright')."""
     browser = browser or os.environ.get("FBU_BROWSER", "playwright")
     if browser == "playwright":
+        opts.setdefault("profile_dir", os.environ.get("FBU_PROFILE_DIR"))
+        opts.setdefault("group", os.environ.get("FBU_GROUP"))
+        opts.setdefault("handoff_mode", os.environ.get("FBU_HANDOFF_MODE", "auto"))
         return PlaywrightBrowser(url, **_pw_opts(opts))
     if browser == "ego":
+        import shutil
+        import sys
+        if sys.platform != "darwin":
+            raise ValueError("ego backend is macOS-only; use --browser playwright (or --profile-dir for login reuse)")
+        if not shutil.which("ego-browser"):
+            raise ValueError("ego-browser CLI not on PATH; install ego lite and complete onboarding")
         from .ego_browser import EgoBrowser
+        opts.setdefault("group", os.environ.get("FBU_GROUP", "default"))
+        opts.setdefault("handoff_mode", os.environ.get("FBU_HANDOFF_MODE", "resume"))
+        opts.setdefault("server_name", os.environ.get("FBU_EGO_SERVER_NAME"))  # None = default service (sandbox-safe)
+        opts.setdefault("space_id", _int_env("FBU_EGO_SPACE_ID"))
         return EgoBrowser(url, **_ego_opts(opts))
     raise ValueError(f"FBU_BROWSER must be playwright or ego, got {browser!r}")
+
+
+def _int_env(name):
+    value = os.environ.get(name)
+    return int(value) if value else None
 
 
 def _pw_opts(opts):

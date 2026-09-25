@@ -18,6 +18,12 @@ def main():
     run.add_argument("url")
     run.add_argument("--goal", required=True)
     run.add_argument("--trace", default="artifacts/run.json")
+    run.add_argument("--browser", choices=["playwright", "ego"], help="Overrides FBU_BROWSER")
+    run.add_argument("--profile-dir", dest="profile_dir", help="Playwright persistent mode (launch_persistent_context)")
+    run.add_argument("--group", help="Per-group isolation (storage_state file or profile dir / ego server-name)")
+    run.add_argument("--handoff", choices=["auto", "never", "always"], help="Handoff trigger (FBU_HANDOFF)")
+    run.add_argument("--handoff-mode", dest="handoff_mode",
+                      choices=["auto", "pause", "resume"], help="Handoff mechanism")
     browser = sub.add_parser("install-browser", help="Install Chromium for this fbu environment (no model download)")
     browser.add_argument("--with-deps", action="store_true", help="Also install Linux browser system dependencies")
     download = sub.add_parser("download", help="Download weights for the selected local backend (no inference API)")
@@ -45,7 +51,7 @@ def main():
         command.add_argument("--device", help="PyTorch device: auto, cpu, cuda or cuda:N (FBU_DEVICE)")
         command.add_argument("--dtype", choices=["auto", "float32", "float16", "bfloat16"], help="PyTorch dtype")
     args = parser.parse_args()
-    for option in ("backend", "device", "dtype", "model"):
+    for option in ("backend", "device", "dtype", "model", "browser", "profile_dir", "group", "handoff", "handoff_mode"):
         value = getattr(args, option, None)
         if value is not None:
             os.environ[f"FBU_{option.upper()}"] = value
