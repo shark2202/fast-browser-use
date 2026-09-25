@@ -26,12 +26,12 @@ class StalePage(ValueError):
 
 
 class PlaywrightBrowser:
-    def __init__(self, url, *, video_dir=None, viewport=None, headless=None):
+    def __init__(self, url, *, video_dir=None, viewport=None, headless=None, profile_dir=None):
         self.driver = sync_playwright().start()
         self.chrome = None
+        self.profile_dir = profile_dir
         try:
             self.headless = os.environ.get("FBU_HEADLESS", "1") != "0" if headless is None else headless
-            self.chrome = self.driver.chromium.launch(headless=self.headless)
             self.locale = os.environ.get("FBU_LOCALE", "en-US")
             options = {
                 "viewport": viewport or {"width": 1120, "height": 780},
@@ -39,18 +39,33 @@ class PlaywrightBrowser:
             }
             if video_dir:
                 options.update(record_video_dir=str(video_dir), record_video_size=options["viewport"])
-            self.context = self.chrome.new_context(**options)
-            self.page = self.context.new_page()
+            if profile_dir:
+                os.makedirs(profile_dir, exist_ok=True)
+                # launch_persistent_context returns a context that owns the profile dir and an initial page.
+                self.chrome = self.driver.chromium.launch_persistent_context(
+                    profile_dir, headless=self.headless, **options
+                )
+                self.context = self.chrome
+                self.page = self.context.pages[0] if self.context.pages else self.context.new_page()
+                self.target = "persistent-chromium"
+            else:
+                self.chrome = self.driver.chromium.launch(headless=self.headless)
+                self.context = self.chrome.new_context(**options)
+                self.page = self.context.new_page()
+                self.target = "isolated-chromium"
             self.navigations = []
             self.page.on("request", self._navigation_request)
             self.video = self.page.video
             self.session = self.context.new_cdp_session(self.page)
-            self.target = "isolated-chromium"
             self.call("Emulation.setFocusEmulationEnabled", enabled=True)
             self.page.goto(url, wait_until="domcontentloaded", timeout=30000)
         except Exception:
             self.close()
             raise
+
+    @property
+    def session_id(self):
+        return self.profile_dir
 
     def call(self, method, **params):
         return self.session.send(method, params)
@@ -173,15 +188,22 @@ class PlaywrightBrowser:
 
     def close(self, *, video_path=None):
         try:
-            if self.chrome is not None:
-                try:
+            if self.chrome is None:
+                return
+            try:
+                if self.profile_dir:
+                    # persistent: chrome is the context; closing finalizes the profile and video.
+                    self.chrome.close()
+                else:
+                    # isolated: chrome is a Browser; close the context first (finalizes video), then the browser.
                     if getattr(self, "context", None):
                         self.context.close()
-                    if video_path and getattr(self, "video", None):
-                        self.video.save_as(str(video_path))
-                finally:
+                if video_path and getattr(self, "video", None):
+                    self.video.save_as(str(video_path))
+            finally:
+                if not self.profile_dir:
                     self.chrome.close()
-                    self.chrome = None
+                self.chrome = None
         finally:
             self.driver.stop()
 
@@ -278,7 +300,7 @@ def make_browser(url, *, browser=None, **opts) -> Browser:
 
 
 def _pw_opts(opts):
-    allowed = {"video_dir", "viewport", "headless"}
+    allowed = {"video_dir", "viewport", "headless", "profile_dir"}
     return {k: v for k, v in opts.items() if k in allowed}
 
 
